@@ -17,7 +17,7 @@ default_yesterday = (datetime.now() - timedelta(1)).strftime('%Y-%m-%d')
 def load_metadata():
     try:
         df = pd.read_csv('sites_metadata.csv')
-        df = df[~df['Name'].str.contains('DELETED|DISABLED', na=False, case=False)]
+        df = df[~df['Name'].str.contains('DELETED|DISABLED|\*', na=False, case=False)]
         df = df.dropna(subset=['Latitude', 'Longitude'])
         df = df[df['Capacity_kWp'] > 0]
         return df
