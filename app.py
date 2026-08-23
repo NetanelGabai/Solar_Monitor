@@ -74,7 +74,6 @@ def get_yoy_baseline(site_ids, current_date_str):
     return pd.DataFrame(data_list)
 
 def get_capacity_from_model(model_name):
-    """ פונקציית עזר לחילוץ גודל הממיר מתוך שם המודל """
     if not model_name:
         return 1.0 
     match = re.search(r'SE(\d+(?:\.\d+)?)', model_name, re.IGNORECASE)
@@ -141,20 +140,38 @@ with st.sidebar:
     target_date = st.date_input("Select Date to Monitor", datetime.strptime(default_yesterday, '%Y-%m-%d'))
     target_date_str = target_date.strftime('%Y-%m-%d')
     
+    # --- סינון לפי חשבונות ---
+    if 'Account_ID' in df_sites.columns:
+        # חילוץ כל החשבונות הקיימים
+        available_accounts = sorted(df_sites['Account_ID'].dropna().astype(int).unique().tolist())
+        
+        # יצירת מולטי-סלקט שבו כל החשבונות מסומנים כברירת מחדל
+        selected_accounts = st.multiselect(
+            "Select Accounts to Monitor", 
+            options=available_accounts, 
+            default=available_accounts
+        )
+        
+        # סינון הטבלה לפי החשבונות שנבחרו
+        df_sites = df_sites[df_sites['Account_ID'].isin(selected_accounts)]
+    
     total_sites = len(df_sites)
     
-    # הוספת אפשרות לסירוק מלא
-    scan_all = st.checkbox(f"Scan All Sites (Production Mode: {total_sites} sites)")
+    st.divider()
+    
+    # --- בחירת כמות אתרים לסריקה ---
+    scan_all = st.checkbox(f"Scan All Selected Sites (Production Mode: {total_sites} sites)")
     
     if scan_all:
         scan_limit = total_sites
     else:
-        scan_limit = st.number_input(f"Number of Sites to Scan (Max: {total_sites})", min_value=1, max_value=total_sites, value=20, step=10)
+        scan_limit = st.number_input(f"Number of Sites to Scan (Max: {total_sites})", min_value=1, max_value=total_sites if total_sites > 0 else 1, value=min(20, total_sites), step=10)
         
     run_button = st.button("🚀 Run Anomaly Detection", use_container_width=True, type="primary")
 
 if run_button:
     if df_sites.empty:
+        st.warning("No sites available for the selected accounts. Please select at least one account.")
         st.stop()
         
     test_site_ids = df_sites['Site_ID'].head(int(scan_limit)).tolist()
