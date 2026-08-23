@@ -204,26 +204,23 @@ if run_button:
     df_master['Lat_Grid'] = df_master['Latitude'].astype(float).round(1)
     df_master['Lon_Grid'] = df_master['Longitude'].astype(float).round(1)
     
-    cluster_stats = df_sites.copy()
-    cluster_stats['Lat_Grid'] = cluster_stats['Latitude'].astype(float).round(1)
-    cluster_stats['Lon_Grid'] = cluster_stats['Longitude'].astype(float).round(1)
-    
     cluster_medians = df_master.groupby(['Lat_Grid', 'Lon_Grid'])['Specific_Yield'].median().reset_index()
     cluster_medians.rename(columns={'Specific_Yield': 'Cluster_Median_Yield'}, inplace=True)
     df_master = pd.merge(df_master, cluster_medians, on=['Lat_Grid', 'Lon_Grid'], how='left')
     
-    # --- השלב החדש והקריטי: צלילת עומק (Deep Scan) לכל הממירים לפני קביעת התראה ---
+    # --- השורה שתוקנה ---
+    df_master['Performance_vs_Cluster'] = np.where(df_master['Cluster_Median_Yield'] > 0, df_master['Specific_Yield'] / df_master['Cluster_Median_Yield'], np.nan)
+    
     status_text.text(f"5/5: Deep Scanning Inverters for ALL {len(df_master)} sites... (This might take a minute)")
     diagnoses = []
     total_sites_count = len(df_master)
     for index, row in df_master.iterrows():
-        # עדכון בר ההתקדמות באופן יחסי
         progress_bar.progress(60 + int((index / total_sites_count) * 35))
         diagnoses.append(get_inverter_diagnosis(row['Site_ID'], target_date_str))
         
     df_master['System_Diagnosis'] = diagnoses
     
-    # --- עדכון חוקי ההתראה: כללנו את ה-YoY וחיפוש של תקלות ממיר ספציפיות! ---
+    # --- מנוע ההתראות המורחב ---
     df_master['Alert_Status'] = np.where(
         (df_master['Performance_vs_Cluster'] < 0.80) | 
         (df_master['7D_Change_%'] < -10.0) | 
@@ -280,7 +277,7 @@ if run_button:
             if 'Offline' in str(s.get('AI Diagnosis', '')): 
                 return ['background-color: #4a1c1c; color: #ffcccc'] * len(s)
             elif 'Fault Suspected' in str(s.get('Status', '')):
-                return ['background-color: #331a00'] * len(s)
+                return ['background-color: #331a00'] * len(s) 
             return [''] * len(s)
             
         st.dataframe(
