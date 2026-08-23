@@ -12,7 +12,7 @@ API_KEY = "K0X7PD9WAJ11B33DM7BUWNY6VCJ9YVFS"
 BASE_URL = "https://monitoringapi.solaredge.com"
 default_yesterday = (datetime.now() - timedelta(1)).strftime('%Y-%m-%d')
 
-# --- פונקציות מנוע החוקים (מאחורי הקלעים) ---
+# --- פונקציות מנוע החוקים ---
 @st.cache_data(ttl=3600)
 def load_metadata():
     try:
@@ -21,7 +21,7 @@ def load_metadata():
         df = df.dropna(subset=['Latitude', 'Longitude'])
         df = df[df['Capacity_kWp'] > 0]
         return df
-    except Exception as e:
+    except Exception:
         st.error("Error loading sites_metadata.csv. Make sure the file exists in the directory.")
         return pd.DataFrame()
 
@@ -113,16 +113,15 @@ with st.sidebar:
     target_date = st.date_input("Select Date to Monitor", datetime.strptime(default_yesterday, '%Y-%m-%d'))
     target_date_str = target_date.strftime('%Y-%m-%d')
     
-    scan_limit = st.slider("Number of Sites to Scan (for testing)", min_value=5, max_value=len(df_sites), value=20, step=5)
+    scan_limit = st.number_input("Number of Sites to Scan (for testing)", min_value=1, max_value=len(df_sites), value=20, step=10)
     run_button = st.button("🚀 Run Anomaly Detection", use_container_width=True, type="primary")
 
 if run_button:
     if df_sites.empty:
         st.stop()
         
-    test_site_ids = df_sites['Site_ID'].head(scan_limit).tolist()
+    test_site_ids = df_sites['Site_ID'].head(int(scan_limit)).tolist()
     
-    # חיווי למשתמש
     progress_bar = st.progress(0)
     status_text = st.empty()
     
@@ -192,23 +191,33 @@ if run_button:
     else:
         st.subheader("🚨 Priority Hit List")
         
-        # עיצוב הטבלה
         display_df = anomalies[['Name', 'City', 'Specific_Yield', 'Cluster_Median_Yield', '7D_Change_%', 'YoY_Change_%', 'System_Diagnosis']].copy()
         
-        # פונקציית צביעה כדי להבליט תקלות חמורות
+        display_df['7D_Change_%'] = display_df['7D_Change_%'].apply(lambda x: f"{x:.1f}%" if pd.notnull(x) else "-")
+        display_df['YoY_Change_%'] = display_df['YoY_Change_%'].apply(lambda x: f"{x:.1f}%" if pd.notnull(x) else "-")
+        display_df.fillna("-", inplace=True)
+        
+        display_df.rename(columns={
+            'Specific_Yield': 'Yield (kWh/kWp)',
+            'Cluster_Median_Yield': 'Area Median (kWh/kWp)',
+            '7D_Change_%': '7-Day Trend',
+            'YoY_Change_%': 'YoY Trend',
+            'System_Diagnosis': 'AI Diagnosis'
+        }, inplace=True)
+        
         def highlight_offline(s):
-            if 'Offline' in str(s): return ['background-color: #ffcccc'] * len(s)
+            if 'Offline' in str(s): 
+                return ['background-color: #4a1c1c; color: #ffcccc'] * len(s)
             return [''] * len(s)
             
         st.dataframe(
             display_df.style
             .format({
-                'Specific_Yield': '{:.2f}',
-                'Cluster_Median_Yield': '{:.2f}',
-                '7D_Change_%': '{:.1f}%',
-                'YoY_Change_%': '{:.1f}%'
+                'Yield (kWh/kWp)': '{:.2f}',
+                'Area Median (kWh/kWp)': '{:.2f}'
             })
-            .apply(highlight_offline, axis=1, subset=['System_Diagnosis']),
+            .apply(highlight_offline, axis=1, subset=['AI Diagnosis']),
             use_container_width=True,
+            hide_index=True,
             height=400
         )
