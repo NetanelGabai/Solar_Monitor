@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import time
+import re
 
 # --- הגדרות האפליקציה ---
 st.set_page_config(page_title="Solar Monitor - Daily Hit List", page_icon="☀️", layout="wide")
@@ -72,6 +73,15 @@ def get_yoy_baseline(site_ids, current_date_str):
             data_list.append({'Site_ID': site_id, 'LY_Avg_Energy_kWh': np.nan})
     return pd.DataFrame(data_list)
 
+def get_capacity_from_model(model_name):
+    """ פונקציית עזר לחילוץ גודל הממיר מתוך שם המודל (לדוגמה SE27.6K יחזיר 27.6) """
+    if not model_name:
+        return 1.0 # ברירת מחדל כדי למנוע חלוקה באפס
+    match = re.search(r'SE(\d+(?:\.\d+)?)', model_name, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    return 1.0 # אם המודל לא תואם לתבנית סולאראדג' המוכרת
+
 def get_inverter_diagnosis(site_id, target_date):
     equip_url = f"{BASE_URL}/equipment/{site_id}/list?api_key={API_KEY}"
     try:
@@ -81,30 +91,51 @@ def get_inverter_diagnosis(site_id, target_date):
         inverters = [eq for eq in res.json().get('reporters', {}).get('list', []) if 'inverter' in eq.get('name', '').lower() or eq.get('type', '') == 'Inverter']
         if not inverters: return "No inverters found"
             
-        inverter_energies = {}
+        inverter_data = {}
         for inv in inverters:
             sn = inv.get('serialNumber')
             name = inv.get('name', sn)
+            model = inv.get('model', '')
+            capacity_kw = get_capacity_from_model(model)
+            
             data_url = f"{BASE_URL}/equipment/{site_id}/{sn}/data?startTime={target_date} 00:00:00&endTime={target_date} 23:59:59&api_key={API_KEY}"
             d_res = requests.get(data_url, timeout=10)
             inv_energy = 0
             if d_res.status_code == 200:
                 energies = [t.get('totalEnergy') for t in d_res.json().get('data', {}).get('telemetries', []) if t.get('totalEnergy') is not None]
                 if energies: inv_energy = (max(energies) - min(energies)) / 1000
-            inverter_energies[name] = inv_energy
             
-        if not inverter_energies: return "No telemetry data"
-        max_energy = max(inverter_energies.values())
-        if max_energy == 0: return "Site Offline: All inverters at 0 kWh"
+            # חישוב תפוקה סגולית לממיר הבודד
+            specific_yield = inv_energy / capacity_kw if capacity_kw > 0 else 0
             
-        faults = [f"{n}: 0 kWh" if e == 0 else f"{n}: Low Output" for n, e in inverter_energies.items() if e < (max_energy * 0.7)]
+            inverter_data[name] = {
+                'energy': inv_energy,
+                'capacity': capacity_kw,
+                'specific_yield': specific_yield
+            }
+            time.sleep(0.1) # השהייה קלה למניעת עומס
+            
+        if not any(d['energy'] > 0 for d in inverter_data.values()): 
+            return "Site Offline: All inverters at 0 kWh"
+            
+        # מציאת התפוקה הסגולית המקסימלית באתר כנקודת ייחוס
+        max_specific_yield = max([d['specific_yield'] for d in inverter_data.values()])
+        
+        faults = []
+        for name, data in inverter_data.items():
+            if data['energy'] == 0:
+                faults.append(f"{name}: 0 kWh")
+            # השוואה לפי תפוקה סגולית ולא תפוקה גולמית!
+            elif data['specific_yield'] < (max_specific_yield * 0.75): 
+                faults.append(f"{name}: Low Output ({data['energy']:.1f} kWh)")
+                
         return "Faults: " + " | ".join(faults) if faults else "Inverters balanced. Check Shading/Soiling."
     except:
         return "Diagnosis Failed"
 
 # --- ממשק המשתמש (UI) ---
 st.title("☀️ Solar Monitor - AI Hit List")
-st.markdown("Automated anomaly detection using Geo-Clustering, YoY trends, and Inverter-level diagnosis.")
+st.markdown("Automated anomaly detection using Geo-Clustering, YoY trends, and normalized Inverter-level diagnosis.")
 
 df_sites = load_metadata()
 
