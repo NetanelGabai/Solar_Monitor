@@ -120,10 +120,13 @@ def get_inverter_diagnosis(site_id, target_date):
         
         faults = []
         for name, data in inverter_data.items():
+            # עיצוב גודל הממיר להצגה (למשל: [27.6kW])
+            cap_label = f"[{data['capacity']:g}kW]" if data['capacity'] > 0 else ""
+            
             if data['energy'] == 0:
-                faults.append(f"{name}: 0 kWh")
+                faults.append(f"{name} {cap_label}: 0 kWh")
             elif data['specific_yield'] < (max_specific_yield * 0.75): 
-                faults.append(f"{name}: Low Output ({data['energy']:.1f} kWh)")
+                faults.append(f"{name} {cap_label}: Low Output ({data['energy']:.1f} kWh)")
                 
         return "Faults: " + " | ".join(faults) if faults else "Inverters balanced. Check Shading/Soiling."
     except:
@@ -208,7 +211,6 @@ if run_button:
     cluster_medians.rename(columns={'Specific_Yield': 'Cluster_Median_Yield'}, inplace=True)
     df_master = pd.merge(df_master, cluster_medians, on=['Lat_Grid', 'Lon_Grid'], how='left')
     
-    # --- השורה שתוקנה ---
     df_master['Performance_vs_Cluster'] = np.where(df_master['Cluster_Median_Yield'] > 0, df_master['Specific_Yield'] / df_master['Cluster_Median_Yield'], np.nan)
     
     status_text.text(f"5/5: Deep Scanning Inverters for ALL {len(df_master)} sites... (This might take a minute)")
@@ -220,7 +222,6 @@ if run_button:
         
     df_master['System_Diagnosis'] = diagnoses
     
-    # --- מנוע ההתראות המורחב ---
     df_master['Alert_Status'] = np.where(
         (df_master['Performance_vs_Cluster'] < 0.80) | 
         (df_master['7D_Change_%'] < -10.0) | 
