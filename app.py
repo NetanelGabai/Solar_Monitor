@@ -140,26 +140,24 @@ with st.sidebar:
     target_date = st.date_input("Select Date to Monitor", datetime.strptime(default_yesterday, '%Y-%m-%d'))
     target_date_str = target_date.strftime('%Y-%m-%d')
     
-    # --- סינון לפי חשבונות ---
-    if 'Account_ID' in df_sites.columns:
-        # חילוץ כל החשבונות הקיימים
-        available_accounts = sorted(df_sites['Account_ID'].dropna().astype(int).unique().tolist())
+    # --- סינון לפי שמות החשבונות מה-CSV ---
+    if 'Account' in df_sites.columns:
+        # שולף את כל השמות הייחודיים מהעמודה שיצרת
+        available_accounts = sorted(df_sites['Account'].dropna().unique().tolist())
         
-        # יצירת מולטי-סלקט שבו כל החשבונות מסומנים כברירת מחדל
         selected_accounts = st.multiselect(
             "Select Accounts to Monitor", 
             options=available_accounts, 
             default=available_accounts
         )
         
-        # סינון הטבלה לפי החשבונות שנבחרו
-        df_sites = df_sites[df_sites['Account_ID'].isin(selected_accounts)]
+        # סינון הטבלה לפי השמות שנבחרו
+        df_sites = df_sites[df_sites['Account'].isin(selected_accounts)]
     
     total_sites = len(df_sites)
     
     st.divider()
     
-    # --- בחירת כמות אתרים לסריקה ---
     scan_all = st.checkbox(f"Scan All Selected Sites (Production Mode: {total_sites} sites)")
     
     if scan_all:
