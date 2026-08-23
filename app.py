@@ -140,44 +140,45 @@ with st.sidebar:
     target_date = st.date_input("Select Date to Monitor", datetime.strptime(default_yesterday, '%Y-%m-%d'))
     target_date_str = target_date.strftime('%Y-%m-%d')
     
-    # --- סינון לפי שמות החשבונות מה-CSV ---
-    if 'Account' in df_sites.columns:
-        # שולף את כל השמות הייחודיים מהעמודה שיצרת
-        available_accounts = sorted(df_sites['Account'].dropna().unique().tolist())
-        
-        selected_accounts = st.multiselect(
-            "Select Accounts to Monitor", 
-            options=available_accounts, 
-            default=available_accounts
+    st.divider()
+    st.subheader("🎯 Site Selection")
+    
+    if not df_sites.empty:
+        site_options = sorted(df_sites['Name'].tolist())
+        selected_sites = st.multiselect(
+            "Select specific sites to scan (optional):", 
+            options=site_options,
+            help="If you select sites here, the scanner will ignore the bulk settings below and ONLY scan these sites."
         )
         
-        # סינון הטבלה לפי השמות שנבחרו
-        df_sites = df_sites[df_sites['Account'].isin(selected_accounts)]
-    
-    total_sites = len(df_sites)
-    
-    st.divider()
-    
-    scan_all = st.checkbox(f"Scan All Selected Sites (Production Mode: {total_sites} sites)")
-    
-    if scan_all:
-        scan_limit = total_sites
-    else:
-        scan_limit = st.number_input(f"Number of Sites to Scan (Max: {total_sites})", min_value=1, max_value=total_sites if total_sites > 0 else 1, value=min(20, total_sites), step=10)
+        st.divider()
         
+        # אם המשתמש לא בחר אתרים ספציפיים, נציג לו את אפשרויות הסריקה הכלליות
+        if not selected_sites:
+            total_sites = len(df_sites)
+            scan_all = st.checkbox(f"Scan All Sites (Production Mode: {total_sites} sites)")
+            
+            if scan_all:
+                scan_limit = total_sites
+            else:
+                scan_limit = st.number_input(f"Number of Sites to Scan (Max: {total_sites})", min_value=1, max_value=total_sites if total_sites > 0 else 1, value=min(20, total_sites), step=10)
+    
     run_button = st.button("🚀 Run Anomaly Detection", use_container_width=True, type="primary")
 
 if run_button:
     if df_sites.empty:
-        st.warning("No sites available for the selected accounts. Please select at least one account.")
         st.stop()
         
-    test_site_ids = df_sites['Site_ID'].head(int(scan_limit)).tolist()
+    # קביעת רשימת האתרים לסריקה (ספציפיים או לפי כמות)
+    if selected_sites:
+        test_site_ids = df_sites[df_sites['Name'].isin(selected_sites)]['Site_ID'].tolist()
+    else:
+        test_site_ids = df_sites['Site_ID'].head(int(scan_limit)).tolist()
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    status_text.text("1/5: Fetching Daily Energy...")
+    status_text.text(f"1/5: Fetching Daily Energy for {len(test_site_ids)} sites...")
     df_daily = get_daily_site_energy(test_site_ids, target_date_str)
     progress_bar.progress(20)
     
@@ -204,9 +205,17 @@ if run_button:
     
     df_master['Lat_Grid'] = df_master['Latitude'].astype(float).round(1)
     df_master['Lon_Grid'] = df_master['Longitude'].astype(float).round(1)
-    cluster_stats = df_master.groupby(['Lat_Grid', 'Lon_Grid'])['Specific_Yield'].median().reset_index()
-    cluster_stats.rename(columns={'Specific_Yield': 'Cluster_Median_Yield'}, inplace=True)
-    df_master = pd.merge(df_master, cluster_stats, on=['Lat_Grid', 'Lon_Grid'], how='left')
+    
+    # חישוב ה-Cluster מתבצע על בסיס כלל אתרי התשתית ולא רק הנסרקים כדי לשמור על דיוק גיאוגרפי
+    cluster_stats = df_sites.copy()
+    cluster_stats['Lat_Grid'] = cluster_stats['Latitude'].astype(float).round(1)
+    cluster_stats['Lon_Grid'] = cluster_stats['Longitude'].astype(float).round(1)
+    # נמשוך תפוקות לכל התשתית רק כדי לחשב ממוצע אזורי מדויק? 
+    # הערה: כדי לחסוך קריאות API, נסתמך רק על האתרים שנסרקו עבור ה-Cluster במקרה הזה.
+    
+    cluster_medians = df_master.groupby(['Lat_Grid', 'Lon_Grid'])['Specific_Yield'].median().reset_index()
+    cluster_medians.rename(columns={'Specific_Yield': 'Cluster_Median_Yield'}, inplace=True)
+    df_master = pd.merge(df_master, cluster_medians, on=['Lat_Grid', 'Lon_Grid'], how='left')
     
     df_master['Performance_vs_Cluster'] = df_master['Specific_Yield'] / df_master['Cluster_Median_Yield']
     
@@ -217,9 +226,13 @@ if run_button:
     )
     progress_bar.progress(80)
     
-    anomalies = df_master[df_master['Alert_Status'] == '🔴 Fault Suspected'].copy()
+    # אם בחרנו אתרים ספציפיים, נרצה לראות את האבחון שלהם גם אם הם תקינים (לצורכי בקרה)
+    if selected_sites:
+        anomalies = df_master.copy()
+    else:
+        anomalies = df_master[df_master['Alert_Status'] == '🔴 Fault Suspected'].copy()
     
-    status_text.text(f"5/5: Drilling down into Inverter data for {len(anomalies)} suspected sites...")
+    status_text.text(f"5/5: Drilling down into Inverter data for {len(anomalies)} sites...")
     diagnoses = []
     for index, row in anomalies.iterrows():
         diagnoses.append(get_inverter_diagnosis(row['Site_ID'], target_date_str))
@@ -235,15 +248,19 @@ if run_button:
     st.divider()
     col1, col2, col3 = st.columns(3)
     col1.metric("Sites Scanned", len(df_master))
-    col2.metric("Anomalies Detected", len(anomalies), delta_color="inverse")
-    col3.metric("Clean Sites", len(df_master) - len(anomalies))
     
-    if anomalies.empty:
-        st.success("All monitored sites are performing well! No anomalies detected.")
+    if selected_sites:
+        col2.metric("Sites Displayed", len(anomalies))
+        st.subheader("🔍 Selected Sites Analysis")
     else:
+        col2.metric("Anomalies Detected", len(anomalies), delta_color="inverse")
+        col3.metric("Clean Sites", len(df_master) - len(anomalies))
         st.subheader("🚨 Priority Hit List")
-        
-        display_df = anomalies[['Name', 'City', 'Specific_Yield', 'Cluster_Median_Yield', '7D_Change_%', 'YoY_Change_%', 'System_Diagnosis']].copy()
+    
+    if anomalies.empty and not selected_sites:
+        st.success("All monitored sites are performing well! No anomalies detected.")
+    elif not anomalies.empty:
+        display_df = anomalies[['Name', 'City', 'Specific_Yield', 'Cluster_Median_Yield', '7D_Change_%', 'YoY_Change_%', 'System_Diagnosis', 'Alert_Status']].copy()
         
         display_df['7D_Change_%'] = display_df['7D_Change_%'].apply(lambda x: f"{x:.1f}%" if pd.notnull(x) else "-")
         display_df['YoY_Change_%'] = display_df['YoY_Change_%'].apply(lambda x: f"{x:.1f}%" if pd.notnull(x) else "-")
@@ -254,12 +271,15 @@ if run_button:
             'Cluster_Median_Yield': 'Area Median (kWh/kWp)',
             '7D_Change_%': '7-Day Trend',
             'YoY_Change_%': 'YoY Trend',
-            'System_Diagnosis': 'AI Diagnosis'
+            'System_Diagnosis': 'AI Diagnosis',
+            'Alert_Status': 'Status'
         }, inplace=True)
         
         def highlight_offline(s):
             if 'Offline' in str(s): 
                 return ['background-color: #4a1c1c; color: #ffcccc'] * len(s)
+            elif 'Fault Suspected' in str(s.get('Status', '')):
+                return ['background-color: #331a00'] * len(s) # צבע חום עדין לתקלות רגילות
             return [''] * len(s)
             
         st.dataframe(
@@ -268,7 +288,7 @@ if run_button:
                 'Yield (kWh/kWp)': '{:.2f}',
                 'Area Median (kWh/kWp)': '{:.2f}'
             })
-            .apply(highlight_offline, axis=1, subset=['AI Diagnosis']),
+            .apply(highlight_offline, axis=1),
             use_container_width=True,
             hide_index=True,
             height=400
