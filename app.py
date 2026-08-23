@@ -74,13 +74,13 @@ def get_yoy_baseline(site_ids, current_date_str):
     return pd.DataFrame(data_list)
 
 def get_capacity_from_model(model_name):
-    """ פונקציית עזר לחילוץ גודל הממיר מתוך שם המודל (לדוגמה SE27.6K יחזיר 27.6) """
+    """ פונקציית עזר לחילוץ גודל הממיר מתוך שם המודל """
     if not model_name:
-        return 1.0 # ברירת מחדל כדי למנוע חלוקה באפס
+        return 1.0 
     match = re.search(r'SE(\d+(?:\.\d+)?)', model_name, re.IGNORECASE)
     if match:
         return float(match.group(1))
-    return 1.0 # אם המודל לא תואם לתבנית סולאראדג' המוכרת
+    return 1.0 
 
 def get_inverter_diagnosis(site_id, target_date):
     equip_url = f"{BASE_URL}/equipment/{site_id}/list?api_key={API_KEY}"
@@ -105,7 +105,6 @@ def get_inverter_diagnosis(site_id, target_date):
                 energies = [t.get('totalEnergy') for t in d_res.json().get('data', {}).get('telemetries', []) if t.get('totalEnergy') is not None]
                 if energies: inv_energy = (max(energies) - min(energies)) / 1000
             
-            # חישוב תפוקה סגולית לממיר הבודד
             specific_yield = inv_energy / capacity_kw if capacity_kw > 0 else 0
             
             inverter_data[name] = {
@@ -113,19 +112,17 @@ def get_inverter_diagnosis(site_id, target_date):
                 'capacity': capacity_kw,
                 'specific_yield': specific_yield
             }
-            time.sleep(0.1) # השהייה קלה למניעת עומס
+            time.sleep(0.1) 
             
         if not any(d['energy'] > 0 for d in inverter_data.values()): 
             return "Site Offline: All inverters at 0 kWh"
             
-        # מציאת התפוקה הסגולית המקסימלית באתר כנקודת ייחוס
         max_specific_yield = max([d['specific_yield'] for d in inverter_data.values()])
         
         faults = []
         for name, data in inverter_data.items():
             if data['energy'] == 0:
                 faults.append(f"{name}: 0 kWh")
-            # השוואה לפי תפוקה סגולית ולא תפוקה גולמית!
             elif data['specific_yield'] < (max_specific_yield * 0.75): 
                 faults.append(f"{name}: Low Output ({data['energy']:.1f} kWh)")
                 
@@ -144,7 +141,16 @@ with st.sidebar:
     target_date = st.date_input("Select Date to Monitor", datetime.strptime(default_yesterday, '%Y-%m-%d'))
     target_date_str = target_date.strftime('%Y-%m-%d')
     
-    scan_limit = st.number_input("Number of Sites to Scan (for testing)", min_value=1, max_value=len(df_sites), value=20, step=10)
+    total_sites = len(df_sites)
+    
+    # הוספת אפשרות לסירוק מלא
+    scan_all = st.checkbox(f"Scan All Sites (Production Mode: {total_sites} sites)")
+    
+    if scan_all:
+        scan_limit = total_sites
+    else:
+        scan_limit = st.number_input(f"Number of Sites to Scan (Max: {total_sites})", min_value=1, max_value=total_sites, value=20, step=10)
+        
     run_button = st.button("🚀 Run Anomaly Detection", use_container_width=True, type="primary")
 
 if run_button:
