@@ -153,7 +153,6 @@ with st.sidebar:
         
         st.divider()
         
-        # אם המשתמש לא בחר אתרים ספציפיים, נציג לו את אפשרויות הסריקה הכלליות
         if not selected_sites:
             total_sites = len(df_sites)
             scan_all = st.checkbox(f"Scan All Sites (Production Mode: {total_sites} sites)")
@@ -169,7 +168,6 @@ if run_button:
     if df_sites.empty:
         st.stop()
         
-    # קביעת רשימת האתרים לסריקה (ספציפיים או לפי כמות)
     if selected_sites:
         test_site_ids = df_sites[df_sites['Name'].isin(selected_sites)]['Site_ID'].tolist()
     else:
@@ -190,7 +188,7 @@ if run_button:
     df_yoy = get_yoy_baseline(test_site_ids, target_date_str)
     progress_bar.progress(60)
     
-    status_text.text("4/5: Running Geo-Clustering Rule Engine...")
+    status_text.text("4/5: Running Geo-Clustering...")
     df_master = pd.merge(df_daily, df_sites, on='Site_ID', how='inner')
     df_master = pd.merge(df_master, df_yoy, on='Site_ID', how='left')
     df_master = pd.merge(df_master, df_7d, on='Site_ID', how='left')
@@ -206,43 +204,46 @@ if run_button:
     df_master['Lat_Grid'] = df_master['Latitude'].astype(float).round(1)
     df_master['Lon_Grid'] = df_master['Longitude'].astype(float).round(1)
     
-    # חישוב ה-Cluster מתבצע על בסיס כלל אתרי התשתית ולא רק הנסרקים כדי לשמור על דיוק גיאוגרפי
     cluster_stats = df_sites.copy()
     cluster_stats['Lat_Grid'] = cluster_stats['Latitude'].astype(float).round(1)
     cluster_stats['Lon_Grid'] = cluster_stats['Longitude'].astype(float).round(1)
-    # נמשוך תפוקות לכל התשתית רק כדי לחשב ממוצע אזורי מדויק? 
-    # הערה: כדי לחסוך קריאות API, נסתמך רק על האתרים שנסרקו עבור ה-Cluster במקרה הזה.
     
     cluster_medians = df_master.groupby(['Lat_Grid', 'Lon_Grid'])['Specific_Yield'].median().reset_index()
     cluster_medians.rename(columns={'Specific_Yield': 'Cluster_Median_Yield'}, inplace=True)
     df_master = pd.merge(df_master, cluster_medians, on=['Lat_Grid', 'Lon_Grid'], how='left')
     
-    df_master['Performance_vs_Cluster'] = df_master['Specific_Yield'] / df_master['Cluster_Median_Yield']
+    # --- השלב החדש והקריטי: צלילת עומק (Deep Scan) לכל הממירים לפני קביעת התראה ---
+    status_text.text(f"5/5: Deep Scanning Inverters for ALL {len(df_master)} sites... (This might take a minute)")
+    diagnoses = []
+    total_sites_count = len(df_master)
+    for index, row in df_master.iterrows():
+        # עדכון בר ההתקדמות באופן יחסי
+        progress_bar.progress(60 + int((index / total_sites_count) * 35))
+        diagnoses.append(get_inverter_diagnosis(row['Site_ID'], target_date_str))
+        
+    df_master['System_Diagnosis'] = diagnoses
     
+    # --- עדכון חוקי ההתראה: כללנו את ה-YoY וחיפוש של תקלות ממיר ספציפיות! ---
     df_master['Alert_Status'] = np.where(
-        (df_master['Performance_vs_Cluster'] < 0.80) | (df_master['7D_Change_%'] < -20.0), 
+        (df_master['Performance_vs_Cluster'] < 0.80) | 
+        (df_master['7D_Change_%'] < -10.0) | 
+        (df_master['YoY_Change_%'] < -20.0) |
+        (df_master['System_Diagnosis'].str.contains('0 kWh|Low Output|Offline|Faults', na=False, regex=True)), 
         '🔴 Fault Suspected', 
         '🟢 OK'
     )
-    progress_bar.progress(80)
     
-    # אם בחרנו אתרים ספציפיים, נרצה לראות את האבחון שלהם גם אם הם תקינים (לצורכי בקרה)
-    if selected_sites:
-        anomalies = df_master.copy()
-    else:
-        anomalies = df_master[df_master['Alert_Status'] == '🔴 Fault Suspected'].copy()
-    
-    status_text.text(f"5/5: Drilling down into Inverter data for {len(anomalies)} sites...")
-    diagnoses = []
-    for index, row in anomalies.iterrows():
-        diagnoses.append(get_inverter_diagnosis(row['Site_ID'], target_date_str))
-    if not anomalies.empty:
-        anomalies['System_Diagnosis'] = diagnoses
     progress_bar.progress(100)
     status_text.text("Scan Complete!")
     time.sleep(1)
     status_text.empty()
     progress_bar.empty()
+    
+    # --- חיתוך האנומליות לתצוגה ---
+    if selected_sites:
+        anomalies = df_master.copy()
+    else:
+        anomalies = df_master[df_master['Alert_Status'] == '🔴 Fault Suspected'].copy()
     
     # --- הצגת התוצאות ---
     st.divider()
@@ -276,10 +277,10 @@ if run_button:
         }, inplace=True)
         
         def highlight_offline(s):
-            if 'Offline' in str(s): 
+            if 'Offline' in str(s.get('AI Diagnosis', '')): 
                 return ['background-color: #4a1c1c; color: #ffcccc'] * len(s)
             elif 'Fault Suspected' in str(s.get('Status', '')):
-                return ['background-color: #331a00'] * len(s) # צבע חום עדין לתקלות רגילות
+                return ['background-color: #331a00'] * len(s)
             return [''] * len(s)
             
         st.dataframe(
