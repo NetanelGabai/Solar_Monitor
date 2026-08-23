@@ -120,7 +120,6 @@ def get_inverter_diagnosis(site_id, target_date):
         
         faults = []
         for name, data in inverter_data.items():
-            # עיצוב גודל הממיר להצגה (למשל: [27.6kW])
             cap_label = f"[{data['capacity']:g}kW]" if data['capacity'] > 0 else ""
             
             if data['energy'] == 0:
@@ -213,15 +212,34 @@ if run_button:
     
     df_master['Performance_vs_Cluster'] = np.where(df_master['Cluster_Median_Yield'] > 0, df_master['Specific_Yield'] / df_master['Cluster_Median_Yield'], np.nan)
     
-    status_text.text(f"5/5: Deep Scanning Inverters for ALL {len(df_master)} sites... (This might take a minute)")
-    diagnoses = []
-    total_sites_count = len(df_master)
-    for index, row in df_master.iterrows():
-        progress_bar.progress(60 + int((index / total_sites_count) * 35))
-        diagnoses.append(get_inverter_diagnosis(row['Site_ID'], target_date_str))
-        
-    df_master['System_Diagnosis'] = diagnoses
+    # --- סינון חכם (Smart Pre-Filter): רדאר רגיש למציאת אתרים לבדיקת ממירים ---
+    # נבדוק ממירים רק באתרים שירדו ב-3% לפחות לעומת השבוע שעבר, או 3% מתחת לחציון האזורי
+    df_master['Needs_Deep_Scan'] = (
+        (df_master['Performance_vs_Cluster'] < 0.97) | 
+        (df_master['7D_Change_%'] < -3.0) | 
+        (df_master['YoY_Change_%'] < -10.0)
+    )
     
+    # אם בחרנו אתר ספציפי ידנית, תמיד נסרוק אותו לעומק
+    if selected_sites:
+        sites_to_scan = df_master.copy()
+    else:
+        sites_to_scan = df_master[df_master['Needs_Deep_Scan']].copy()
+    
+    status_text.text(f"5/5: Deep Scanning Inverters for {len(sites_to_scan)} suspicious sites (Smart Filter applied)...")
+    
+    diagnoses_dict = {}
+    total_sites_count = len(sites_to_scan)
+    
+    for index, (i, row) in enumerate(sites_to_scan.iterrows()):
+        if total_sites_count > 0:
+            progress_bar.progress(60 + int((index / total_sites_count) * 35))
+        diagnoses_dict[row['Site_ID']] = get_inverter_diagnosis(row['Site_ID'], target_date_str)
+        
+    # הצמדת התוצאות לטבלה המלאה (אתרים שלא נסרקו יקבלו סטטוס תקין)
+    df_master['System_Diagnosis'] = df_master['Site_ID'].map(diagnoses_dict).fillna("Skipped (Site Optimal - No Drops Detected)")
+    
+    # --- מנוע ההתראות הסופי ---
     df_master['Alert_Status'] = np.where(
         (df_master['Performance_vs_Cluster'] < 0.80) | 
         (df_master['7D_Change_%'] < -10.0) | 
