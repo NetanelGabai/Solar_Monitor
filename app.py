@@ -12,6 +12,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # --- הגדרות האפליקציה ---
 st.set_page_config(page_title="Solar Monitor - Daily Hit List", page_icon="☀️", layout="wide")
 
+# --- הגדרות MIN MAX (נקודת האיזון למהירות ויציבות) ---
+MAX_WORKERS = 4        # מקסימום פועלים במקביל (מונע עומס על VCOM)
+VCOM_MICRO_DELAY = 0.25 # השהיה זעירה של רבע שנייה לאחר כל הצלחה כדי למנוע חסימה (429)
+
 # --- הגדרות SolarEdge ---
 API_KEY = "K0X7PD9WAJ11B33DM7BUWNY6VCJ9YVFS"
 BASE_URL = "https://monitoringapi.solaredge.com"
@@ -39,6 +43,7 @@ def vcom_request_with_retry(url, auth, headers, params=None):
         try:
             res = global_http_session.get(url, auth=auth, headers=headers, params=params, timeout=15)
             if res.status_code == 200:
+                time.sleep(VCOM_MICRO_DELAY) # הרמזור שמווסת את התנועה ומונע חסימות!
                 return res
             elif res.status_code == 429: 
                 time.sleep((2 * (attempt + 1)) + random.uniform(0.1, 1.0)) 
@@ -305,12 +310,10 @@ if run_button:
         elif portal == 'VCOM':
             auth, headers = get_vcom_auth(row['Account_Name'])
             if auth:
-                # מסלול מהיר - System Level
                 system_vals = fetch_vcom_system_energy(site_id, auth, headers, vcom_start, vcom_end)
                 if system_vals:
                     return {'Site_ID': site_id, 'Energy_kWh': max(system_vals) * 1000}
                 
-                # מסלול גיבוי - Inverter Level
                 site_energy_total = 0.0
                 has_data = False
                 inverters = get_vcom_inverters(site_id, auth, headers)
@@ -328,7 +331,7 @@ if run_button:
 
     energy_data = []
     completed = 0
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(fetch_daily, row) for _, row in sites_to_scan.iterrows()]
         for future in as_completed(futures):
             energy_data.append(future.result())
@@ -382,7 +385,7 @@ if run_button:
 
     data_7d = []
     completed = 0
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(fetch_7d, row) for _, row in sites_to_scan.iterrows()]
         for future in as_completed(futures):
             data_7d.append(future.result())
@@ -438,7 +441,7 @@ if run_button:
 
     data_yoy = []
     completed = 0
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(fetch_yoy, row) for _, row in sites_to_scan.iterrows()]
         for future in as_completed(futures):
             data_yoy.append(future.result())
@@ -491,7 +494,7 @@ if run_button:
     def fetch_diagnosis(row):
         return row['Site_ID'], get_inverter_diagnosis(row, target_date_str)
         
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(fetch_diagnosis, row) for _, row in sites_to_deep_scan.iterrows()]
         for future in as_completed(futures):
             site_id, diagnosis_result = future.result()
