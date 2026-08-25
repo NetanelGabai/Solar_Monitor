@@ -5,72 +5,185 @@ import numpy as np
 from datetime import datetime, timedelta
 import time
 import re
+from requests.auth import HTTPBasicAuth
 
 # --- הגדרות האפליקציה ---
 st.set_page_config(page_title="Solar Monitor - Daily Hit List", page_icon="☀️", layout="wide")
 
+# --- הגדרות SolarEdge ---
 API_KEY = "K0X7PD9WAJ11B33DM7BUWNY6VCJ9YVFS"
 BASE_URL = "https://monitoringapi.solaredge.com"
 default_yesterday = (datetime.now() - timedelta(1)).strftime('%Y-%m-%d')
+
+# --- הגדרות VCOM (Meteocontrol) ---
+VCOM_BASE_URL = "https://api.meteocontrol.de/v2"
+VCOM_CREDENTIALS = {
+    "electraservice": {
+        "PASSWORD": "Elec74New!++",
+        "API_KEY": "d8860d256e03c97ca24c8548c2979be6489add6c2e4a46e1c1964fb5c65bf01a"
+    },
+    "ELECTRA - PV": {
+        "PASSWORD": "Elec74New!++",
+        "API_KEY": "d8860d256e03c97ca24c8548c2979be6489add6c2e4a46e1c1964fb5c65bf01a"
+    }
+}
+
+# --- פונקציות עזר (Auth) ---
+def get_vcom_auth(account_name):
+    if account_name in VCOM_CREDENTIALS:
+        creds = VCOM_CREDENTIALS[account_name]
+        return HTTPBasicAuth(account_name, creds['PASSWORD']), {"X-API-KEY": creds['API_KEY'], "Accept": "application/json"}
+    return None, None
+
+def get_vcom_first_inverter(site_id, auth, headers):
+    try:
+        inv_res = requests.get(f"{VCOM_BASE_URL}/systems/{site_id}/inverters", auth=auth, headers=headers, timeout=10)
+        if inv_res.status_code == 200 and inv_res.json().get('data'):
+            return inv_res.json()['data'][0]['id']
+    except:
+        pass
+    return None
 
 # --- פונקציות מנוע החוקים ---
 @st.cache_data(ttl=3600)
 def load_metadata():
     try:
         df = pd.read_csv('sites_metadata.csv')
-        df = df[~df['Name'].str.contains('DELETED|DISABLED|\*', na=False, case=False)]
+        df = df[~df['Name'].str.contains(r'DELETED|DISABLED|\*|^Z\s*-', na=False, case=False)]
         df = df.dropna(subset=['Latitude', 'Longitude'])
         df = df[df['Capacity_kWp'] > 0]
+        # השלמת עמודות במקרה של קובץ ישן
+        if 'Portal' not in df.columns: df['Portal'] = 'SolarEdge'
+        if 'Account_Name' not in df.columns: df['Account_Name'] = ''
         return df
     except Exception:
         st.error("Error loading sites_metadata.csv. Make sure the file exists in the directory.")
         return pd.DataFrame()
 
-def get_daily_site_energy(site_ids, target_date):
+def get_daily_site_energy(df_sites_to_scan, target_date_str):
     energy_data = []
-    for site_id in site_ids:
-        url = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={target_date}&endDate={target_date}&api_key={API_KEY}"
-        try:
-            res = requests.get(url, timeout=10)
-            if res.status_code == 200:
-                val = res.json()['energy']['values'][0]['value']
-                energy_data.append({'Site_ID': site_id, 'Energy_kWh': 0 if val is None else val})
-        except:
-            pass
+    vcom_start = f"{target_date_str}T00:00:00Z"
+    vcom_end = f"{target_date_str}T23:59:59Z"
+    
+    for index, row in df_sites_to_scan.iterrows():
+        site_id = str(row['Site_ID'])
+        portal = row.get('Portal', 'SolarEdge')
+        
+        if portal == 'SolarEdge':
+            url = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={target_date_str}&endDate={target_date_str}&api_key={API_KEY}"
+            try:
+                res = requests.get(url, timeout=10)
+                if res.status_code == 200:
+                    val = res.json()['energy']['values'][0]['value']
+                    energy_data.append({'Site_ID': site_id, 'Energy_kWh': 0 if val is None else val})
+            except:
+                energy_data.append({'Site_ID': site_id, 'Energy_kWh': np.nan})
+                
+        elif portal == 'VCOM':
+            auth, headers = get_vcom_auth(row['Account_Name'])
+            if auth:
+                inv_id = get_vcom_first_inverter(site_id, auth, headers)
+                if inv_id:
+                    meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
+                    try:
+                        meas_res = requests.get(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"}, timeout=10)
+                        if meas_res.status_code == 200:
+                            data = meas_res.json().get('data', [])
+                            if data and data[0].get('value') is not None:
+                                # VCOM מחזיר ב-kWh, סולאראדג' ב-Wh. נכפיל כדי שהלוגיקה הראשית שמחלקת ב-1000 תעבוד לשניהם.
+                                val = data[0]['value'] * 1000 
+                                energy_data.append({'Site_ID': site_id, 'Energy_kWh': val})
+                                continue
+                    except:
+                        pass
+            energy_data.append({'Site_ID': site_id, 'Energy_kWh': np.nan})
+            
     return pd.DataFrame(energy_data)
 
-def get_7_day_baseline(site_ids, target_date_str):
+def get_7_day_baseline(df_sites_to_scan, target_date_str):
     target_date = datetime.strptime(target_date_str, '%Y-%m-%d')
     start_date_str = (target_date - timedelta(days=7)).strftime('%Y-%m-%d')
     data_list = []
-    for site_id in site_ids:
-        url = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={start_date_str}&endDate={target_date_str}&api_key={API_KEY}"
-        try:
-            res = requests.get(url, timeout=10)
-            if res.status_code == 200:
-                vals = [v['value'] for v in res.json().get('energy', {}).get('values', []) if v.get('value') is not None]
-                avg = sum(vals)/len(vals) if vals else np.nan
-                data_list.append({'Site_ID': site_id, '7D_Avg_Energy_kWh': avg / 1000 if not np.isnan(avg) else np.nan})
-        except:
+    
+    vcom_start = f"{start_date_str}T00:00:00Z"
+    vcom_end = f"{target_date_str}T23:59:59Z"
+    
+    for index, row in df_sites_to_scan.iterrows():
+        site_id = str(row['Site_ID'])
+        portal = row.get('Portal', 'SolarEdge')
+        
+        if portal == 'SolarEdge':
+            url = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={start_date_str}&endDate={target_date_str}&api_key={API_KEY}"
+            try:
+                res = requests.get(url, timeout=10)
+                if res.status_code == 200:
+                    vals = [v['value'] for v in res.json().get('energy', {}).get('values', []) if v.get('value') is not None]
+                    avg = sum(vals)/len(vals) if vals else np.nan
+                    data_list.append({'Site_ID': site_id, '7D_Avg_Energy_kWh': avg / 1000 if not np.isnan(avg) else np.nan})
+            except:
+                data_list.append({'Site_ID': site_id, '7D_Avg_Energy_kWh': np.nan})
+                
+        elif portal == 'VCOM':
+            auth, headers = get_vcom_auth(row['Account_Name'])
+            if auth:
+                inv_id = get_vcom_first_inverter(site_id, auth, headers)
+                if inv_id:
+                    meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
+                    try:
+                        meas_res = requests.get(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"}, timeout=10)
+                        if meas_res.status_code == 200:
+                            vals = [v['value'] for v in meas_res.json().get('data', []) if v.get('value') is not None]
+                            avg = sum(vals)/len(vals) if vals else np.nan
+                            data_list.append({'Site_ID': site_id, '7D_Avg_Energy_kWh': avg if not np.isnan(avg) else np.nan})
+                            continue
+                    except:
+                        pass
             data_list.append({'Site_ID': site_id, '7D_Avg_Energy_kWh': np.nan})
+            
     return pd.DataFrame(data_list)
 
-def get_yoy_baseline(site_ids, current_date_str):
+def get_yoy_baseline(df_sites_to_scan, current_date_str):
     current_date = datetime.strptime(current_date_str, '%Y-%m-%d')
     ly_end = current_date.replace(year=current_date.year - 1)
     ly_start_str = (ly_end - timedelta(days=14)).strftime('%Y-%m-%d')
     ly_end_str = ly_end.strftime('%Y-%m-%d')
     data_list = []
-    for site_id in site_ids:
-        url = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={ly_start_str}&endDate={ly_end_str}&api_key={API_KEY}"
-        try:
-            res = requests.get(url, timeout=10)
-            if res.status_code == 200:
-                vals = [v['value'] for v in res.json().get('energy', {}).get('values', []) if v.get('value') is not None]
-                avg = sum(vals)/len(vals) if vals else np.nan
-                data_list.append({'Site_ID': site_id, 'LY_Avg_Energy_kWh': avg / 1000 if not np.isnan(avg) else np.nan})
-        except:
+    
+    vcom_start = f"{ly_start_str}T00:00:00Z"
+    vcom_end = f"{ly_end_str}T23:59:59Z"
+    
+    for index, row in df_sites_to_scan.iterrows():
+        site_id = str(row['Site_ID'])
+        portal = row.get('Portal', 'SolarEdge')
+        
+        if portal == 'SolarEdge':
+            url = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={ly_start_str}&endDate={ly_end_str}&api_key={API_KEY}"
+            try:
+                res = requests.get(url, timeout=10)
+                if res.status_code == 200:
+                    vals = [v['value'] for v in res.json().get('energy', {}).get('values', []) if v.get('value') is not None]
+                    avg = sum(vals)/len(vals) if vals else np.nan
+                    data_list.append({'Site_ID': site_id, 'LY_Avg_Energy_kWh': avg / 1000 if not np.isnan(avg) else np.nan})
+            except:
+                data_list.append({'Site_ID': site_id, 'LY_Avg_Energy_kWh': np.nan})
+                
+        elif portal == 'VCOM':
+            auth, headers = get_vcom_auth(row['Account_Name'])
+            if auth:
+                inv_id = get_vcom_first_inverter(site_id, auth, headers)
+                if inv_id:
+                    meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
+                    try:
+                        meas_res = requests.get(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"}, timeout=10)
+                        if meas_res.status_code == 200:
+                            vals = [v['value'] for v in meas_res.json().get('data', []) if v.get('value') is not None]
+                            avg = sum(vals)/len(vals) if vals else np.nan
+                            data_list.append({'Site_ID': site_id, 'LY_Avg_Energy_kWh': avg if not np.isnan(avg) else np.nan})
+                            continue
+                    except:
+                        pass
             data_list.append({'Site_ID': site_id, 'LY_Avg_Energy_kWh': np.nan})
+            
     return pd.DataFrame(data_list)
 
 def get_capacity_from_model(model_name):
@@ -81,7 +194,14 @@ def get_capacity_from_model(model_name):
         return float(match.group(1))
     return 1.0 
 
-def get_inverter_diagnosis(site_id, target_date):
+def get_inverter_diagnosis(row, target_date):
+    site_id = str(row['Site_ID'])
+    portal = row.get('Portal', 'SolarEdge')
+    
+    if portal == 'VCOM':
+        return "VCOM: AI Diagnosis in development"
+        
+    # --- SolarEdge Logic ---
     equip_url = f"{BASE_URL}/equipment/{site_id}/list?api_key={API_KEY}"
     try:
         res = requests.get(equip_url, timeout=10)
@@ -131,6 +251,7 @@ def get_inverter_diagnosis(site_id, target_date):
     except:
         return "Diagnosis Failed"
 
+
 # --- ממשק המשתמש (UI) ---
 st.title("☀️ Solar Monitor - AI Hit List")
 st.markdown("Automated anomaly detection using Geo-Clustering, YoY trends, and normalized Inverter-level diagnosis.")
@@ -171,23 +292,23 @@ if run_button:
         st.stop()
         
     if selected_sites:
-        test_site_ids = df_sites[df_sites['Name'].isin(selected_sites)]['Site_ID'].tolist()
+        sites_to_scan = df_sites[df_sites['Name'].isin(selected_sites)].copy()
     else:
-        test_site_ids = df_sites['Site_ID'].head(int(scan_limit)).tolist()
+        sites_to_scan = df_sites.head(int(scan_limit)).copy()
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    status_text.text(f"1/5: Fetching Daily Energy for {len(test_site_ids)} sites...")
-    df_daily = get_daily_site_energy(test_site_ids, target_date_str)
+    status_text.text(f"1/5: Fetching Daily Energy for {len(sites_to_scan)} sites...")
+    df_daily = get_daily_site_energy(sites_to_scan, target_date_str)
     progress_bar.progress(20)
     
     status_text.text("2/5: Fetching 7-Day Trend...")
-    df_7d = get_7_day_baseline(test_site_ids, target_date_str)
+    df_7d = get_7_day_baseline(sites_to_scan, target_date_str)
     progress_bar.progress(40)
     
     status_text.text("3/5: Fetching YoY Baseline...")
-    df_yoy = get_yoy_baseline(test_site_ids, target_date_str)
+    df_yoy = get_yoy_baseline(sites_to_scan, target_date_str)
     progress_bar.progress(60)
     
     status_text.text("4/5: Running Geo-Clustering...")
@@ -212,34 +333,31 @@ if run_button:
     
     df_master['Performance_vs_Cluster'] = np.where(df_master['Cluster_Median_Yield'] > 0, df_master['Specific_Yield'] / df_master['Cluster_Median_Yield'], np.nan)
     
-    # --- סינון חכם (Smart Pre-Filter): רדאר רגיש למציאת אתרים לבדיקת ממירים ---
-    # נבדוק ממירים רק באתרים שירדו ב-3% לפחות לעומת השבוע שעבר, או 3% מתחת לחציון האזורי
+    # --- סינון חכם (Smart Pre-Filter) ---
     df_master['Needs_Deep_Scan'] = (
         (df_master['Performance_vs_Cluster'] < 0.97) | 
         (df_master['7D_Change_%'] < -3.0) | 
         (df_master['YoY_Change_%'] < -10.0)
     )
     
-    # אם בחרנו אתר ספציפי ידנית, תמיד נסרוק אותו לעומק
     if selected_sites:
-        sites_to_scan = df_master.copy()
+        sites_to_deep_scan = df_master.copy()
     else:
-        sites_to_scan = df_master[df_master['Needs_Deep_Scan']].copy()
+        sites_to_deep_scan = df_master[df_master['Needs_Deep_Scan']].copy()
     
-    status_text.text(f"5/5: Deep Scanning Inverters for {len(sites_to_scan)} suspicious sites (Smart Filter applied)...")
+    status_text.text(f"5/5: Deep Scanning Inverters for {len(sites_to_deep_scan)} suspicious sites...")
     
     diagnoses_dict = {}
-    total_sites_count = len(sites_to_scan)
+    total_sites_count = len(sites_to_deep_scan)
     
-    for index, (i, row) in enumerate(sites_to_scan.iterrows()):
+    for index, (i, row) in enumerate(sites_to_deep_scan.iterrows()):
         if total_sites_count > 0:
             progress_bar.progress(60 + int((index / total_sites_count) * 35))
-        diagnoses_dict[row['Site_ID']] = get_inverter_diagnosis(row['Site_ID'], target_date_str)
+        # עכשיו נעביר את כל השורה לפונקציה כדי שתדע אם זה סולאראדג' או VCOM
+        diagnoses_dict[row['Site_ID']] = get_inverter_diagnosis(row, target_date_str)
         
-    # הצמדת התוצאות לטבלה המלאה (אתרים שלא נסרקו יקבלו סטטוס תקין)
     df_master['System_Diagnosis'] = df_master['Site_ID'].map(diagnoses_dict).fillna("Skipped (Site Optimal - No Drops Detected)")
     
-    # --- מנוע ההתראות הסופי ---
     df_master['Alert_Status'] = np.where(
         (df_master['Performance_vs_Cluster'] < 0.80) | 
         (df_master['7D_Change_%'] < -10.0) | 
@@ -255,13 +373,12 @@ if run_button:
     status_text.empty()
     progress_bar.empty()
     
-    # --- חיתוך האנומליות לתצוגה ---
+    # --- הצגת התוצאות ---
     if selected_sites:
         anomalies = df_master.copy()
     else:
         anomalies = df_master[df_master['Alert_Status'] == '🔴 Fault Suspected'].copy()
     
-    # --- הצגת התוצאות ---
     st.divider()
     col1, col2, col3 = st.columns(3)
     col1.metric("Sites Scanned", len(df_master))
