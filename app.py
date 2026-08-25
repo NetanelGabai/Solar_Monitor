@@ -398,6 +398,9 @@ if run_button:
         
         display_df['7D_Change_%'] = display_df['7D_Change_%'].apply(lambda x: f"{x:.1f}%" if pd.notnull(x) else "-")
         display_df['YoY_Change_%'] = display_df['YoY_Change_%'].apply(lambda x: f"{x:.1f}%" if pd.notnull(x) else "-")
+        
+        # המרת הטבלה לסוג "אובייקט" שמאפשר שילוב של מספרים וטקסט (כמו המקף)
+        display_df = display_df.astype(object) 
         display_df.fillna("-", inplace=True)
         
         display_df.rename(columns={
