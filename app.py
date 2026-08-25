@@ -36,7 +36,6 @@ def get_vcom_auth(account_name):
     return None, None
 
 def get_vcom_inverters(site_id, auth, headers):
-    """מושך את רשימת כל הממירים באתר VCOM"""
     try:
         inv_res = requests.get(f"{VCOM_BASE_URL}/systems/{site_id}/inverters", auth=auth, headers=headers, timeout=10)
         if inv_res.status_code == 200:
@@ -93,16 +92,15 @@ def get_daily_site_energy(df_sites_to_scan, target_date_str):
                     try:
                         meas_res = requests.get(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"}, timeout=10)
                         if meas_res.status_code == 200:
-                            # פנייה נכונה למבנה ה-JSON של VCOM למדידות
-                            data = meas_res.json().get(inv_id, {}).get('E_DAY', [])
+                            # התיקון מיושם כאן!
+                            data = meas_res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
                             valid_vals = [d['value'] for d in data if d.get('value') is not None]
                             if valid_vals:
-                                # לוקחים את המקסימום מבין הדגימות של אותו יום כדי לקבל את הסך היומי
                                 site_energy_total += max(valid_vals) * 1000 
                                 has_data = True
                     except:
                         pass
-                    time.sleep(0.1) # מניעת חסימות מול VCOM
+                    time.sleep(0.1) 
                     
             if has_data:
                 energy_data.append({'Site_ID': site_id, 'Energy_kWh': site_energy_total})
@@ -147,11 +145,12 @@ def get_7_day_baseline(df_sites_to_scan, target_date_str):
                     try:
                         meas_res = requests.get(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"}, timeout=10)
                         if meas_res.status_code == 200:
-                            data = meas_res.json().get(inv_id, {}).get('E_DAY', [])
+                            # התיקון מיושם כאן!
+                            data = meas_res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
                             vals = [d['value'] for d in data if d.get('value') is not None]
                             if vals:
                                 inv_avg = sum(vals)/len(vals)
-                                site_avg_total += inv_avg # VCOM מחזיר קוט"ש, אז אין צורך לחלק ב-1000
+                                site_avg_total += inv_avg 
                                 has_data = True
                     except:
                         pass
@@ -202,7 +201,8 @@ def get_yoy_baseline(df_sites_to_scan, current_date_str):
                     try:
                         meas_res = requests.get(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"}, timeout=10)
                         if meas_res.status_code == 200:
-                            data = meas_res.json().get(inv_id, {}).get('E_DAY', [])
+                            # התיקון מיושם כאן!
+                            data = meas_res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
                             vals = [d['value'] for d in data if d.get('value') is not None]
                             if vals:
                                 inv_avg = sum(vals)/len(vals)
