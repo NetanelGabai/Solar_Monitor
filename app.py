@@ -13,8 +13,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 st.set_page_config(page_title="Solar Monitor - Daily Hit List", page_icon="☀️", layout="wide")
 
 # --- הגדרות MIN MAX (נקודת האיזון למהירות ויציבות) ---
-MAX_WORKERS = 4        # מקסימום פועלים במקביל (מונע עומס על VCOM)
-VCOM_MICRO_DELAY = 0.25 # השהיה זעירה של רבע שנייה לאחר כל הצלחה כדי למנוע חסימה (429)
+MAX_WORKERS = 4
+VCOM_MICRO_DELAY = 0.25 
 
 # --- הגדרות SolarEdge ---
 API_KEY = "K0X7PD9WAJ11B33DM7BUWNY6VCJ9YVFS"
@@ -34,21 +34,23 @@ VCOM_CREDENTIALS = {
     }
 }
 
-# --- מנוע טורבו והגנה מ-Rate Limits ---
+# --- מנוע טורבו והגנה מ-Rate Limits גנרי לכולם ---
 global_http_session = requests.Session() 
 vcom_inverters_cache = {} 
 
-def vcom_request_with_retry(url, auth, headers, params=None):
+def request_with_retry(url, auth=None, headers=None, params=None):
+    """מנגנון חכם ואחיד לכל סוגי ה-API למניעת שגיאות זמניות וחסימות"""
     for attempt in range(5): 
         try:
             res = global_http_session.get(url, auth=auth, headers=headers, params=params, timeout=15)
             if res.status_code == 200:
-                time.sleep(VCOM_MICRO_DELAY) # הרמזור שמווסת את התנועה ומונע חסימות!
+                if "meteocontrol" in url:
+                    time.sleep(VCOM_MICRO_DELAY) # הרמזור חל רק על VCOM
                 return res
             elif res.status_code == 429: 
                 time.sleep((2 * (attempt + 1)) + random.uniform(0.1, 1.0)) 
                 continue
-        except:
+        except requests.exceptions.RequestException:
             pass
         time.sleep(1) 
     return None
@@ -63,7 +65,7 @@ def get_vcom_inverters(site_id, auth, headers):
     if site_id in vcom_inverters_cache:
         return vcom_inverters_cache[site_id]
         
-    res = vcom_request_with_retry(f"{VCOM_BASE_URL}/systems/{site_id}/inverters", auth=auth, headers=headers)
+    res = request_with_retry(f"{VCOM_BASE_URL}/systems/{site_id}/inverters", auth=auth, headers=headers)
     if res and res.status_code == 200:
         inverters = {str(inv['id']): inv.get('name', str(inv['id'])) for inv in res.json().get('data', [])}
         vcom_inverters_cache[site_id] = inverters
@@ -71,9 +73,9 @@ def get_vcom_inverters(site_id, auth, headers):
     return {}
 
 def fetch_vcom_system_energy(site_id, auth, headers, start_dt, end_dt):
-    """ שליפה מהירה במכה אחת ברמת המערכת (System Level) במקום לולאה על ממירים """
+    """ שליפה מהירה ברמת המערכת """
     meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/abbreviations/E_DAY/measurements"
-    res = vcom_request_with_retry(meas_url, auth=auth, headers=headers, params={"from": start_dt, "to": end_dt, "resolution": "day"})
+    res = request_with_retry(meas_url, auth=auth, headers=headers, params={"from": start_dt, "to": end_dt, "resolution": "day"})
     if res and res.status_code == 200:
         data_block = res.json().get('data', {})
         e_day_data = data_block.get(site_id, {}).get('E_DAY', []) 
@@ -85,19 +87,29 @@ def fetch_vcom_system_energy(site_id, auth, headers, start_dt, end_dt):
             return vals
     return None
 
+def fetch_vcom_inverter_e_day(site_id, inv_id, auth, headers, start_dt, end_dt):
+    """ פונקציית עזר למניעת שכפול קוד בשליפת תפוקת ממיר """
+    url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
+    res = request_with_retry(url, auth=auth, headers=headers, params={"from": start_dt, "to": end_dt, "resolution": "day"})
+    if res:
+        data = res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
+        return [d['value'] for d in data if d.get('value') is not None and d.get('value') > 0]
+    return []
+
 # --- פונקציות מנוע החוקים ---
 @st.cache_data(ttl=3600)
 def load_metadata():
     try:
-        df = pd.read_csv('sites_metadata.csv')
+        df = pd.read_csv('sites_metadata.csv', encoding='utf-8-sig') # תמיכה בטוחה יותר בעברית
         df = df[~df['Name'].str.contains(r'DELETED|DISABLED|\*|^Z\s*-', na=False, case=False)]
         df = df.dropna(subset=['Latitude', 'Longitude'])
+        df['Capacity_kWp'] = pd.to_numeric(df['Capacity_kWp'], errors='coerce') # המרה בטוחה
         df = df[df['Capacity_kWp'] > 0]
         if 'Portal' not in df.columns: df['Portal'] = 'SolarEdge'
         if 'Account_Name' not in df.columns: df['Account_Name'] = ''
         return df
-    except Exception:
-        st.error("Error loading sites_metadata.csv. Make sure the file exists in the directory.")
+    except Exception as e:
+        st.error(f"Error loading sites_metadata.csv: {e}")
         return pd.DataFrame()
 
 def get_capacity_from_model(model_name):
@@ -123,17 +135,8 @@ def get_inverter_diagnosis(row, target_date):
         day_end = f"{target_date}T23:59:59+03:00"
         
         for inv_id, inv_name in inverters.items():
-            meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
-            meas_res = vcom_request_with_retry(meas_url, auth=auth, headers=headers, params={"from": day_start, "to": day_end, "resolution": "day"})
-            if meas_res:
-                data = meas_res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
-                valid_vals = [d['value'] for d in data if d.get('value') is not None and d.get('value') > 0]
-                if valid_vals:
-                    inv_energies[inv_name] = max(valid_vals) 
-                else:
-                    inv_energies[inv_name] = 0.0
-            else:
-                inv_energies[inv_name] = 0.0
+            valid_vals = fetch_vcom_inverter_e_day(site_id, inv_id, auth, headers, day_start, day_end)
+            inv_energies[inv_name] = max(valid_vals) if valid_vals else 0.0
                 
         max_inv_energy = max(inv_energies.values()) if inv_energies else 0
         for name, energy in inv_energies.items():
@@ -147,7 +150,7 @@ def get_inverter_diagnosis(row, target_date):
         
         for inv_id, inv_name in inverters.items():
             abbr_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations"
-            abbr_res = vcom_request_with_retry(abbr_url, auth=auth, headers=headers)
+            abbr_res = request_with_retry(abbr_url, auth=auth, headers=headers)
             if not abbr_res: continue
             
             available_abbrs = abbr_res.json().get('data', [])
@@ -157,7 +160,7 @@ def get_inverter_diagnosis(row, target_date):
             
             abbr_str = ",".join(dc_abbrs)
             meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/{abbr_str}/measurements"
-            meas_res = vcom_request_with_retry(meas_url, auth=auth, headers=headers, params={"from": start_time, "to": end_time, "resolution": "15min"})
+            meas_res = request_with_retry(meas_url, auth=auth, headers=headers, params={"from": start_time, "to": end_time, "resolution": "15min"})
             
             if not meas_res: continue
             
@@ -184,8 +187,8 @@ def get_inverter_diagnosis(row, target_date):
     elif portal == 'SolarEdge':
         equip_url = f"{BASE_URL}/equipment/{site_id}/list?api_key={API_KEY}"
         try:
-            res = global_http_session.get(equip_url, timeout=15)
-            if res.status_code != 200: return "API Error"
+            res = request_with_retry(equip_url)
+            if not res or res.status_code != 200: return "API Error"
             
             inverters = [eq for eq in res.json().get('reporters', {}).get('list', []) if 'inverter' in eq.get('name', '').lower() or eq.get('type', '') == 'Inverter']
             if not inverters: return "No inverters found"
@@ -197,11 +200,11 @@ def get_inverter_diagnosis(row, target_date):
                 capacity_kw = get_capacity_from_model(inv.get('model', ''))
                 
                 data_url = f"{BASE_URL}/equipment/{site_id}/{sn}/data?startTime={target_date} 00:00:00&endTime={target_date} 23:59:59&api_key={API_KEY}"
-                d_res = global_http_session.get(data_url, timeout=15)
+                d_res = request_with_retry(data_url)
                 inv_energy = 0
-                if d_res.status_code == 200:
+                if d_res and d_res.status_code == 200:
                     energies = [t.get('totalEnergy') for t in d_res.json().get('data', {}).get('telemetries', []) if t.get('totalEnergy') is not None]
-                    if energies: inv_energy = (max(energies) - min(energies)) / 1000
+                    if energies: inv_energy = (max(energies) - min(energies)) / 1000 # סולאראדג' ציוד מחזיר ב-Wh
                 
                 inverter_data[name] = {
                     'energy': inv_energy,
@@ -222,8 +225,8 @@ def get_inverter_diagnosis(row, target_date):
                     faults.append(f"{name} {cap_label}: Low Output ({data['energy']:.1f} kWh)")
                     
             return "Faults: " + " | ".join(faults) if faults else "Inverters balanced. Check Shading/Soiling."
-        except:
-            return "Diagnosis Failed"
+        except Exception as e:
+            return f"Diagnosis Failed: {str(e)[:30]}"
 
 # --- ממשק המשתמש (UI) ---
 st.title("☀️ Solar Monitor - AI Hit List")
@@ -300,10 +303,10 @@ if run_button:
         if portal == 'SolarEdge':
             url = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={target_date_str}&endDate={target_date_str}&api_key={API_KEY}"
             try:
-                res = global_http_session.get(url, timeout=15)
-                if res.status_code == 200:
+                res = request_with_retry(url)
+                if res and res.status_code == 200:
                     val = res.json()['energy']['values'][0]['value']
-                    return {'Site_ID': site_id, 'Energy_kWh': 0 if val is None else val}
+                    return {'Site_ID': site_id, 'Energy_kWh': val / 1000 if val is not None else 0} # המרה מיידית ל-kWh
             except: pass
             return {'Site_ID': site_id, 'Energy_kWh': np.nan}
             
@@ -312,20 +315,16 @@ if run_button:
             if auth:
                 system_vals = fetch_vcom_system_energy(site_id, auth, headers, vcom_start, vcom_end)
                 if system_vals:
-                    return {'Site_ID': site_id, 'Energy_kWh': max(system_vals) * 1000}
+                    return {'Site_ID': site_id, 'Energy_kWh': max(system_vals)} # כבר ב-kWh
                 
                 site_energy_total = 0.0
                 has_data = False
                 inverters = get_vcom_inverters(site_id, auth, headers)
                 for inv_id in inverters: 
-                    meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
-                    meas_res = vcom_request_with_retry(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"})
-                    if meas_res:
-                        data = meas_res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
-                        valid_vals = [d['value'] for d in data if d.get('value') is not None and d.get('value') > 0]
-                        if valid_vals:
-                            site_energy_total += max(valid_vals) * 1000 
-                            has_data = True
+                    vals = fetch_vcom_inverter_e_day(site_id, inv_id, auth, headers, vcom_start, vcom_end)
+                    if vals:
+                        site_energy_total += max(vals) 
+                        has_data = True
                 return {'Site_ID': site_id, 'Energy_kWh': site_energy_total if has_data else np.nan}
         return {'Site_ID': site_id, 'Energy_kWh': np.nan}
 
@@ -353,11 +352,11 @@ if run_button:
         if portal == 'SolarEdge':
             url = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={start_date_str}&endDate={target_date_str}&api_key={API_KEY}"
             try:
-                res = global_http_session.get(url, timeout=15)
-                if res.status_code == 200:
+                res = request_with_retry(url)
+                if res and res.status_code == 200:
                     vals = [v['value'] for v in res.json().get('energy', {}).get('values', []) if v.get('value') is not None]
                     avg = sum(vals)/len(vals) if vals else np.nan
-                    return {'Site_ID': site_id, '7D_Avg_Energy_kWh': avg / 1000 if not np.isnan(avg) else np.nan}
+                    return {'Site_ID': site_id, '7D_Avg_Energy_kWh': (avg / 1000) if not np.isnan(avg) else np.nan}
             except: pass
             return {'Site_ID': site_id, '7D_Avg_Energy_kWh': np.nan}
             
@@ -372,14 +371,10 @@ if run_button:
                 has_data = False
                 inverters = get_vcom_inverters(site_id, auth, headers)
                 for inv_id in inverters:
-                    meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
-                    meas_res = vcom_request_with_retry(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"})
-                    if meas_res:
-                        data = meas_res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
-                        vals = [d['value'] for d in data if d.get('value') is not None and d.get('value') > 0]
-                        if vals:
-                            site_avg_total += sum(vals)/len(vals)
-                            has_data = True
+                    vals = fetch_vcom_inverter_e_day(site_id, inv_id, auth, headers, vcom_start, vcom_end)
+                    if vals:
+                        site_avg_total += sum(vals)/len(vals)
+                        has_data = True
                 return {'Site_ID': site_id, '7D_Avg_Energy_kWh': site_avg_total if has_data else np.nan}
         return {'Site_ID': site_id, '7D_Avg_Energy_kWh': np.nan}
 
@@ -409,11 +404,11 @@ if run_button:
         if portal == 'SolarEdge':
             url = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={ly_start_str}&endDate={ly_end_str}&api_key={API_KEY}"
             try:
-                res = global_http_session.get(url, timeout=15)
-                if res.status_code == 200:
+                res = request_with_retry(url)
+                if res and res.status_code == 200:
                     vals = [v['value'] for v in res.json().get('energy', {}).get('values', []) if v.get('value') is not None]
                     avg = sum(vals)/len(vals) if vals else np.nan
-                    return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': avg / 1000 if not np.isnan(avg) else np.nan}
+                    return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': (avg / 1000) if not np.isnan(avg) else np.nan}
             except: pass
             return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': np.nan}
             
@@ -428,14 +423,10 @@ if run_button:
                 has_data = False
                 inverters = get_vcom_inverters(site_id, auth, headers)
                 for inv_id in inverters:
-                    meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
-                    meas_res = vcom_request_with_retry(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"})
-                    if meas_res:
-                        data = meas_res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
-                        vals = [d['value'] for d in data if d.get('value') is not None and d.get('value') > 0]
-                        if vals:
-                            site_avg_total += sum(vals)/len(vals)
-                            has_data = True
+                    vals = fetch_vcom_inverter_e_day(site_id, inv_id, auth, headers, vcom_start, vcom_end)
+                    if vals:
+                        site_avg_total += sum(vals)/len(vals)
+                        has_data = True
                 return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': site_avg_total if has_data else np.nan}
         return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': np.nan}
 
@@ -456,7 +447,7 @@ if run_button:
     df_master = pd.merge(df_master, df_yoy, on='Site_ID', how='left')
     df_master = pd.merge(df_master, df_7d, on='Site_ID', how='left')
     
-    df_master['Energy_kWh'] = df_master['Energy_kWh'] / 1000
+    # הסרנו את החלוקה הכפולה השבירה - הנתונים כבר ב-kWh
     df_master['Specific_Yield'] = df_master['Energy_kWh'] / df_master['Capacity_kWp']
     df_master['LY_Avg_Yield'] = df_master['LY_Avg_Energy_kWh'] / df_master['Capacity_kWp']
     df_master['7D_Avg_Yield'] = df_master['7D_Avg_Energy_kWh'] / df_master['Capacity_kWp']
