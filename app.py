@@ -92,7 +92,6 @@ def get_daily_site_energy(df_sites_to_scan, target_date_str):
                     try:
                         meas_res = requests.get(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"}, timeout=10)
                         if meas_res.status_code == 200:
-                            # התיקון מיושם כאן!
                             data = meas_res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
                             valid_vals = [d['value'] for d in data if d.get('value') is not None]
                             if valid_vals:
@@ -145,7 +144,6 @@ def get_7_day_baseline(df_sites_to_scan, target_date_str):
                     try:
                         meas_res = requests.get(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"}, timeout=10)
                         if meas_res.status_code == 200:
-                            # התיקון מיושם כאן!
                             data = meas_res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
                             vals = [d['value'] for d in data if d.get('value') is not None]
                             if vals:
@@ -201,7 +199,6 @@ def get_yoy_baseline(df_sites_to_scan, current_date_str):
                     try:
                         meas_res = requests.get(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"}, timeout=10)
                         if meas_res.status_code == 200:
-                            # התיקון מיושם כאן!
                             data = meas_res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
                             vals = [d['value'] for d in data if d.get('value') is not None]
                             if vals:
@@ -284,6 +281,7 @@ def get_inverter_diagnosis(row, target_date):
     except:
         return "Diagnosis Failed"
 
+
 # --- ממשק המשתמש (UI) ---
 st.title("☀️ Solar Monitor - AI Hit List")
 st.markdown("Automated anomaly detection using Geo-Clustering, YoY trends, and normalized Inverter-level diagnosis.")
@@ -308,13 +306,25 @@ with st.sidebar:
         
         st.divider()
         
+        scan_mode = None
+        scan_limit = 0
+        
         if not selected_sites:
+            st.subheader("🗂️ Bulk Scan Options")
             total_sites = len(df_sites)
-            scan_all = st.checkbox(f"Scan All Sites (Production Mode: {total_sites} sites)")
             
-            if scan_all:
-                scan_limit = total_sites
-            else:
+            scan_mode = st.radio(
+                "Select portfolio to scan:",
+                options=[
+                    "🧪 Test Mode (Custom Sample)",
+                    "☀️ All SolarEdge Sites",
+                    "⚡ VCOM: electraservice",
+                    "⚡ VCOM: ELECTRA - PV",
+                    f"⚠️ Scan ALL ({total_sites} sites - High Timeout Risk)"
+                ]
+            )
+            
+            if scan_mode == "🧪 Test Mode (Custom Sample)":
                 scan_limit = st.number_input(f"Number of Sites to Scan (Max: {total_sites})", min_value=1, max_value=total_sites if total_sites > 0 else 1, value=min(20, total_sites), step=10)
     
     run_button = st.button("🚀 Run Anomaly Detection", use_container_width=True, type="primary")
@@ -326,7 +336,18 @@ if run_button:
     if selected_sites:
         sites_to_scan = df_sites[df_sites['Name'].isin(selected_sites)].copy()
     else:
-        sites_to_scan = df_sites.head(int(scan_limit)).copy()
+        if scan_mode == "🧪 Test Mode (Custom Sample)":
+            sites_to_scan = df_sites.head(int(scan_limit)).copy()
+        elif scan_mode == "☀️ All SolarEdge Sites":
+            sites_to_scan = df_sites[df_sites['Portal'] == 'SolarEdge'].copy()
+        elif scan_mode == "⚡ VCOM: electraservice":
+            sites_to_scan = df_sites[(df_sites['Portal'] == 'VCOM') & (df_sites['Account_Name'] == 'electraservice')].copy()
+        elif scan_mode == "⚡ VCOM: ELECTRA - PV":
+            sites_to_scan = df_sites[(df_sites['Portal'] == 'VCOM') & (df_sites['Account_Name'] == 'ELECTRA - PV')].copy()
+        elif scan_mode and scan_mode.startswith("⚠️ Scan ALL"):
+            sites_to_scan = df_sites.copy()
+        else:
+            sites_to_scan = df_sites.head(20).copy()
     
     progress_bar = st.progress(0)
     status_text = st.empty()
