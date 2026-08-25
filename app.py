@@ -60,7 +60,6 @@ def get_vcom_inverters(site_id, auth, headers):
         
     res = vcom_request_with_retry(f"{VCOM_BASE_URL}/systems/{site_id}/inverters", auth=auth, headers=headers)
     if res and res.status_code == 200:
-        # עכשיו אנחנו שומרים מילון של {מזהה: שם_ממיר} במקום רק רשימת מזהים
         inverters = {str(inv['id']): inv.get('name', str(inv['id'])) for inv in res.json().get('data', [])}
         vcom_inverters_cache[site_id] = inverters
         return inverters
@@ -106,7 +105,7 @@ def get_daily_site_energy(df_sites_to_scan, target_date_str):
             has_data = False
             if auth:
                 inverters = get_vcom_inverters(site_id, auth, headers)
-                for inv_id in inverters: # איטרציה על המפתחות של המילון
+                for inv_id in inverters: 
                     meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
                     meas_res = vcom_request_with_retry(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"})
                     if meas_res:
@@ -243,24 +242,20 @@ def get_inverter_diagnosis(row, target_date):
         inverters = get_vcom_inverters(site_id, auth, headers)
         if not inverters: return "No inverters found"
         
-        # חלון זמן דיאגנוסטיקה (צהריים, שעון ישראל) כדי לבדוק זרם נקי ובולט
         start_time = f"{target_date}T11:00:00+03:00"
         end_time = f"{target_date}T13:00:00+03:00"
         
         faults = []
         for inv_id, inv_name in inverters.items():
-            # 1. אילו חיישנים קיימים בממיר?
             abbr_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations"
             abbr_res = vcom_request_with_retry(abbr_url, auth=auth, headers=headers)
             if not abbr_res: continue
             
-            # שליפת החיישנים שמתחילים ב-I_DC (זרם ישר)
             available_abbrs = abbr_res.json().get('data', [])
             dc_abbrs = [abbr for abbr in available_abbrs if abbr.startswith('I_DC')]
             
             if not dc_abbrs: continue
             
-            # 2. שליפת הזרמים לכל הסטרינגים במכה אחת לשעות הצהריים
             abbr_str = ",".join(dc_abbrs)
             meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/{abbr_str}/measurements"
             meas_res = vcom_request_with_retry(meas_url, auth=auth, headers=headers, params={"from": start_time, "to": end_time, "resolution": "15min"})
@@ -277,19 +272,17 @@ def get_inverter_diagnosis(row, target_date):
                 
             if not string_medians: continue
             
-            # 3. לוגיקת האנומליות - השוואת הסטרינגים הפנימיים
             inv_median_current = np.median(list(string_medians.values()))
             
             for abbr, current in string_medians.items():
-                if current < 0.5: # זרם אפסי
+                if current < 0.5: 
                     faults.append(f"{inv_name} ({abbr}): 0A (Suspected Open String/Blown Fuse)")
-                elif inv_median_current > 2.0 and current < (inv_median_current * 0.6): # ירידה של מעל 40%
+                elif inv_median_current > 2.0 and current < (inv_median_current * 0.6): 
                     faults.append(f"{inv_name} ({abbr}): Low Current ({current:.1f}A vs avg {inv_median_current:.1f}A)")
                     
         return "Faults: " + " | ".join(faults) if faults else "Inverters DC balanced. Check Shading/Soiling."
         
     elif portal == 'SolarEdge':
-        # --- הלוגיקה המקורית והשמורה של סולאראדג' ---
         equip_url = f"{BASE_URL}/equipment/{site_id}/list?api_key={API_KEY}"
         try:
             res = global_http_session.get(equip_url, timeout=15)
@@ -440,15 +433,24 @@ if run_button:
     else:
         sites_to_deep_scan = df_master[df_master['Needs_Deep_Scan']].copy()
     
-    status_text.text(f"5/5: Deep Scanning Inverters for {len(sites_to_deep_scan)} suspicious sites...")
+    status_text.text(f"5/5: Deep Scanning Inverters for {len(sites_to_deep_scan)} suspicious sites (Turbo Mode)...")
     
     diagnoses_dict = {}
     total_sites_count = len(sites_to_deep_scan)
+    completed_scans = 0
     
-    for index, (i, row) in enumerate(sites_to_deep_scan.iterrows()):
-        if total_sites_count > 0:
-            progress_bar.progress(60 + int((index / total_sites_count) * 35))
-        diagnoses_dict[row['Site_ID']] = get_inverter_diagnosis(row, target_date_str)
+    # --- התיקון הקריטי: עיבוד מקבילי גם לשלב הדיאגנוסטיקה ---
+    def fetch_diagnosis(row):
+        return row['Site_ID'], get_inverter_diagnosis(row, target_date_str)
+        
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(fetch_diagnosis, row) for _, row in sites_to_deep_scan.iterrows()]
+        for future in as_completed(futures):
+            site_id, diagnosis_result = future.result()
+            diagnoses_dict[site_id] = diagnosis_result
+            completed_scans += 1
+            if total_sites_count > 0:
+                progress_bar.progress(60 + int((completed_scans / total_sites_count) * 35))
         
     df_master['System_Diagnosis'] = df_master['Site_ID'].map(diagnoses_dict).fillna("Skipped (Site Optimal - No Drops Detected)")
     
