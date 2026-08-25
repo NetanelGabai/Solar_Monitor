@@ -65,6 +65,21 @@ def get_vcom_inverters(site_id, auth, headers):
         return inverters
     return {}
 
+def fetch_vcom_system_energy(site_id, auth, headers, start_dt, end_dt):
+    """ שליפה מהירה במכה אחת ברמת המערכת (System Level) במקום לולאה על ממירים """
+    meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/abbreviations/E_DAY/measurements"
+    res = vcom_request_with_retry(meas_url, auth=auth, headers=headers, params={"from": start_dt, "to": end_dt, "resolution": "day"})
+    if res and res.status_code == 200:
+        data_block = res.json().get('data', {})
+        e_day_data = data_block.get(site_id, {}).get('E_DAY', []) 
+        if not e_day_data: 
+            e_day_data = data_block.get('E_DAY', [])
+        
+        vals = [d['value'] for d in e_day_data if d.get('value') is not None and d.get('value') > 0]
+        if vals:
+            return vals
+    return None
+
 # --- פונקציות מנוע החוקים ---
 @st.cache_data(ttl=3600)
 def load_metadata():
@@ -276,6 +291,7 @@ if run_button:
         portal = row.get('Portal', 'SolarEdge')
         vcom_start = f"{target_date_str}T00:00:00+03:00"
         vcom_end = f"{target_date_str}T23:59:59+03:00"
+        
         if portal == 'SolarEdge':
             url = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={target_date_str}&endDate={target_date_str}&api_key={API_KEY}"
             try:
@@ -285,11 +301,18 @@ if run_button:
                     return {'Site_ID': site_id, 'Energy_kWh': 0 if val is None else val}
             except: pass
             return {'Site_ID': site_id, 'Energy_kWh': np.nan}
+            
         elif portal == 'VCOM':
             auth, headers = get_vcom_auth(row['Account_Name'])
-            site_energy_total = 0.0
-            has_data = False
             if auth:
+                # מסלול מהיר - System Level
+                system_vals = fetch_vcom_system_energy(site_id, auth, headers, vcom_start, vcom_end)
+                if system_vals:
+                    return {'Site_ID': site_id, 'Energy_kWh': max(system_vals) * 1000}
+                
+                # מסלול גיבוי - Inverter Level
+                site_energy_total = 0.0
+                has_data = False
                 inverters = get_vcom_inverters(site_id, auth, headers)
                 for inv_id in inverters: 
                     meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
@@ -300,12 +323,12 @@ if run_button:
                         if valid_vals:
                             site_energy_total += max(valid_vals) * 1000 
                             has_data = True
-            return {'Site_ID': site_id, 'Energy_kWh': site_energy_total if has_data else np.nan}
+                return {'Site_ID': site_id, 'Energy_kWh': site_energy_total if has_data else np.nan}
         return {'Site_ID': site_id, 'Energy_kWh': np.nan}
 
     energy_data = []
     completed = 0
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(fetch_daily, row) for _, row in sites_to_scan.iterrows()]
         for future in as_completed(futures):
             energy_data.append(future.result())
@@ -323,6 +346,7 @@ if run_button:
         start_date_str = (target_dt - timedelta(days=7)).strftime('%Y-%m-%d')
         vcom_start = f"{start_date_str}T00:00:00+03:00"
         vcom_end = f"{target_date_str}T23:59:59+03:00"
+        
         if portal == 'SolarEdge':
             url = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={start_date_str}&endDate={target_date_str}&api_key={API_KEY}"
             try:
@@ -333,11 +357,16 @@ if run_button:
                     return {'Site_ID': site_id, '7D_Avg_Energy_kWh': avg / 1000 if not np.isnan(avg) else np.nan}
             except: pass
             return {'Site_ID': site_id, '7D_Avg_Energy_kWh': np.nan}
+            
         elif portal == 'VCOM':
             auth, headers = get_vcom_auth(row['Account_Name'])
-            site_avg_total = 0.0
-            has_data = False
             if auth:
+                system_vals = fetch_vcom_system_energy(site_id, auth, headers, vcom_start, vcom_end)
+                if system_vals:
+                    return {'Site_ID': site_id, '7D_Avg_Energy_kWh': sum(system_vals)/len(system_vals)}
+                
+                site_avg_total = 0.0
+                has_data = False
                 inverters = get_vcom_inverters(site_id, auth, headers)
                 for inv_id in inverters:
                     meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
@@ -346,15 +375,14 @@ if run_button:
                         data = meas_res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
                         vals = [d['value'] for d in data if d.get('value') is not None and d.get('value') > 0]
                         if vals:
-                            inv_avg = sum(vals)/len(vals)
-                            site_avg_total += inv_avg 
+                            site_avg_total += sum(vals)/len(vals)
                             has_data = True
-            return {'Site_ID': site_id, '7D_Avg_Energy_kWh': site_avg_total if has_data else np.nan}
+                return {'Site_ID': site_id, '7D_Avg_Energy_kWh': site_avg_total if has_data else np.nan}
         return {'Site_ID': site_id, '7D_Avg_Energy_kWh': np.nan}
 
     data_7d = []
     completed = 0
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(fetch_7d, row) for _, row in sites_to_scan.iterrows()]
         for future in as_completed(futures):
             data_7d.append(future.result())
@@ -374,6 +402,7 @@ if run_button:
         ly_end_str = ly_end.strftime('%Y-%m-%d')
         vcom_start = f"{ly_start_str}T00:00:00+03:00"
         vcom_end = f"{ly_end_str}T23:59:59+03:00"
+        
         if portal == 'SolarEdge':
             url = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={ly_start_str}&endDate={ly_end_str}&api_key={API_KEY}"
             try:
@@ -384,11 +413,16 @@ if run_button:
                     return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': avg / 1000 if not np.isnan(avg) else np.nan}
             except: pass
             return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': np.nan}
+            
         elif portal == 'VCOM':
             auth, headers = get_vcom_auth(row['Account_Name'])
-            site_avg_total = 0.0
-            has_data = False
             if auth:
+                system_vals = fetch_vcom_system_energy(site_id, auth, headers, vcom_start, vcom_end)
+                if system_vals:
+                    return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': sum(system_vals)/len(system_vals)}
+                
+                site_avg_total = 0.0
+                has_data = False
                 inverters = get_vcom_inverters(site_id, auth, headers)
                 for inv_id in inverters:
                     meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
@@ -397,15 +431,14 @@ if run_button:
                         data = meas_res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
                         vals = [d['value'] for d in data if d.get('value') is not None and d.get('value') > 0]
                         if vals:
-                            inv_avg = sum(vals)/len(vals)
-                            site_avg_total += inv_avg 
+                            site_avg_total += sum(vals)/len(vals)
                             has_data = True
-            return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': site_avg_total if has_data else np.nan}
+                return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': site_avg_total if has_data else np.nan}
         return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': np.nan}
 
     data_yoy = []
     completed = 0
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(fetch_yoy, row) for _, row in sites_to_scan.iterrows()]
         for future in as_completed(futures):
             data_yoy.append(future.result())
@@ -458,7 +491,7 @@ if run_button:
     def fetch_diagnosis(row):
         return row['Site_ID'], get_inverter_diagnosis(row, target_date_str)
         
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(fetch_diagnosis, row) for _, row in sites_to_deep_scan.iterrows()]
         for future in as_completed(futures):
             site_id, diagnosis_result = future.result()
