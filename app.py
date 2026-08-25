@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import time
 import re
 from requests.auth import HTTPBasicAuth
+from concurrent.futures import ThreadPoolExecutor, as_completed # התוספת לעיבוד מקבילי
 
 # --- הגדרות האפליקציה ---
 st.set_page_config(page_title="Solar Monitor - Daily Hit List", page_icon="☀️", layout="wide")
@@ -28,7 +29,10 @@ VCOM_CREDENTIALS = {
     }
 }
 
-# --- פונקציות עזר (Auth & Inverters) ---
+# --- מנוע טורבו לשליפות ---
+global_http_session = requests.Session() # שומר על חיבור פתוח
+vcom_inverters_cache = {} # זוכר ממירים כדי לחסוך קריאות API
+
 def get_vcom_auth(account_name):
     if account_name in VCOM_CREDENTIALS:
         creds = VCOM_CREDENTIALS[account_name]
@@ -36,10 +40,15 @@ def get_vcom_auth(account_name):
     return None, None
 
 def get_vcom_inverters(site_id, auth, headers):
+    if site_id in vcom_inverters_cache:
+        return vcom_inverters_cache[site_id]
+        
     try:
-        inv_res = requests.get(f"{VCOM_BASE_URL}/systems/{site_id}/inverters", auth=auth, headers=headers, timeout=10)
+        inv_res = global_http_session.get(f"{VCOM_BASE_URL}/systems/{site_id}/inverters", auth=auth, headers=headers, timeout=10)
         if inv_res.status_code == 200:
-            return [str(inv['id']) for inv in inv_res.json().get('data', [])]
+            inverters = [str(inv['id']) for inv in inv_res.json().get('data', [])]
+            vcom_inverters_cache[site_id] = inverters
+            return inverters
     except:
         pass
     return []
@@ -60,37 +69,34 @@ def load_metadata():
         return pd.DataFrame()
 
 def get_daily_site_energy(df_sites_to_scan, target_date_str):
-    energy_data = []
     vcom_start = f"{target_date_str}T00:00:00Z"
     vcom_end = f"{target_date_str}T23:59:59Z"
     
-    for index, row in df_sites_to_scan.iterrows():
+    def fetch_single(row):
         site_id = str(row['Site_ID'])
         portal = row.get('Portal', 'SolarEdge')
         
         if portal == 'SolarEdge':
             url = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={target_date_str}&endDate={target_date_str}&api_key={API_KEY}"
             try:
-                res = requests.get(url, timeout=10)
+                res = global_http_session.get(url, timeout=10)
                 if res.status_code == 200:
                     val = res.json()['energy']['values'][0]['value']
-                    energy_data.append({'Site_ID': site_id, 'Energy_kWh': 0 if val is None else val})
-                    continue
+                    return {'Site_ID': site_id, 'Energy_kWh': 0 if val is None else val}
             except:
                 pass
-            energy_data.append({'Site_ID': site_id, 'Energy_kWh': np.nan})
+            return {'Site_ID': site_id, 'Energy_kWh': np.nan}
                 
         elif portal == 'VCOM':
             auth, headers = get_vcom_auth(row['Account_Name'])
-            has_data = False
             site_energy_total = 0.0
-            
+            has_data = False
             if auth:
                 inverters = get_vcom_inverters(site_id, auth, headers)
                 for inv_id in inverters:
                     meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
                     try:
-                        meas_res = requests.get(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"}, timeout=10)
+                        meas_res = global_http_session.get(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"}, timeout=10)
                         if meas_res.status_code == 200:
                             data = meas_res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
                             valid_vals = [d['value'] for d in data if d.get('value') is not None]
@@ -99,50 +105,50 @@ def get_daily_site_energy(df_sites_to_scan, target_date_str):
                                 has_data = True
                     except:
                         pass
-                    time.sleep(0.1) 
-                    
-            if has_data:
-                energy_data.append({'Site_ID': site_id, 'Energy_kWh': site_energy_total})
-            else:
-                energy_data.append({'Site_ID': site_id, 'Energy_kWh': np.nan})
-                
+            return {'Site_ID': site_id, 'Energy_kWh': site_energy_total if has_data else np.nan}
+        return {'Site_ID': site_id, 'Energy_kWh': np.nan}
+
+    energy_data = []
+    # מריץ 10 אתרים במקביל!
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(fetch_single, row) for _, row in df_sites_to_scan.iterrows()]
+        for future in as_completed(futures):
+            energy_data.append(future.result())
+            
     return pd.DataFrame(energy_data)
 
 def get_7_day_baseline(df_sites_to_scan, target_date_str):
     target_date = datetime.strptime(target_date_str, '%Y-%m-%d')
     start_date_str = (target_date - timedelta(days=7)).strftime('%Y-%m-%d')
-    data_list = []
     vcom_start = f"{start_date_str}T00:00:00Z"
     vcom_end = f"{target_date_str}T23:59:59Z"
     
-    for index, row in df_sites_to_scan.iterrows():
+    def fetch_single(row):
         site_id = str(row['Site_ID'])
         portal = row.get('Portal', 'SolarEdge')
         
         if portal == 'SolarEdge':
             url = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={start_date_str}&endDate={target_date_str}&api_key={API_KEY}"
             try:
-                res = requests.get(url, timeout=10)
+                res = global_http_session.get(url, timeout=10)
                 if res.status_code == 200:
                     vals = [v['value'] for v in res.json().get('energy', {}).get('values', []) if v.get('value') is not None]
                     avg = sum(vals)/len(vals) if vals else np.nan
-                    data_list.append({'Site_ID': site_id, '7D_Avg_Energy_kWh': avg / 1000 if not np.isnan(avg) else np.nan})
-                    continue
+                    return {'Site_ID': site_id, '7D_Avg_Energy_kWh': avg / 1000 if not np.isnan(avg) else np.nan}
             except:
                 pass
-            data_list.append({'Site_ID': site_id, '7D_Avg_Energy_kWh': np.nan})
+            return {'Site_ID': site_id, '7D_Avg_Energy_kWh': np.nan}
                 
         elif portal == 'VCOM':
             auth, headers = get_vcom_auth(row['Account_Name'])
-            has_data = False
             site_avg_total = 0.0
-            
+            has_data = False
             if auth:
                 inverters = get_vcom_inverters(site_id, auth, headers)
                 for inv_id in inverters:
                     meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
                     try:
-                        meas_res = requests.get(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"}, timeout=10)
+                        meas_res = global_http_session.get(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"}, timeout=10)
                         if meas_res.status_code == 200:
                             data = meas_res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
                             vals = [d['value'] for d in data if d.get('value') is not None]
@@ -152,12 +158,14 @@ def get_7_day_baseline(df_sites_to_scan, target_date_str):
                                 has_data = True
                     except:
                         pass
-                    time.sleep(0.1)
-                    
-            if has_data:
-                data_list.append({'Site_ID': site_id, '7D_Avg_Energy_kWh': site_avg_total})
-            else:
-                data_list.append({'Site_ID': site_id, '7D_Avg_Energy_kWh': np.nan})
+            return {'Site_ID': site_id, '7D_Avg_Energy_kWh': site_avg_total if has_data else np.nan}
+        return {'Site_ID': site_id, '7D_Avg_Energy_kWh': np.nan}
+
+    data_list = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(fetch_single, row) for _, row in df_sites_to_scan.iterrows()]
+        for future in as_completed(futures):
+            data_list.append(future.result())
             
     return pd.DataFrame(data_list)
 
@@ -166,38 +174,35 @@ def get_yoy_baseline(df_sites_to_scan, current_date_str):
     ly_end = current_date.replace(year=current_date.year - 1)
     ly_start_str = (ly_end - timedelta(days=14)).strftime('%Y-%m-%d')
     ly_end_str = ly_end.strftime('%Y-%m-%d')
-    data_list = []
     vcom_start = f"{ly_start_str}T00:00:00Z"
     vcom_end = f"{ly_end_str}T23:59:59Z"
     
-    for index, row in df_sites_to_scan.iterrows():
+    def fetch_single(row):
         site_id = str(row['Site_ID'])
         portal = row.get('Portal', 'SolarEdge')
         
         if portal == 'SolarEdge':
             url = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={ly_start_str}&endDate={ly_end_str}&api_key={API_KEY}"
             try:
-                res = requests.get(url, timeout=10)
+                res = global_http_session.get(url, timeout=10)
                 if res.status_code == 200:
                     vals = [v['value'] for v in res.json().get('energy', {}).get('values', []) if v.get('value') is not None]
                     avg = sum(vals)/len(vals) if vals else np.nan
-                    data_list.append({'Site_ID': site_id, 'LY_Avg_Energy_kWh': avg / 1000 if not np.isnan(avg) else np.nan})
-                    continue
+                    return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': avg / 1000 if not np.isnan(avg) else np.nan}
             except:
                 pass
-            data_list.append({'Site_ID': site_id, 'LY_Avg_Energy_kWh': np.nan})
+            return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': np.nan}
                 
         elif portal == 'VCOM':
             auth, headers = get_vcom_auth(row['Account_Name'])
-            has_data = False
             site_avg_total = 0.0
-            
+            has_data = False
             if auth:
                 inverters = get_vcom_inverters(site_id, auth, headers)
                 for inv_id in inverters:
                     meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
                     try:
-                        meas_res = requests.get(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"}, timeout=10)
+                        meas_res = global_http_session.get(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"}, timeout=10)
                         if meas_res.status_code == 200:
                             data = meas_res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
                             vals = [d['value'] for d in data if d.get('value') is not None]
@@ -207,21 +212,21 @@ def get_yoy_baseline(df_sites_to_scan, current_date_str):
                                 has_data = True
                     except:
                         pass
-                    time.sleep(0.1)
-                    
-            if has_data:
-                data_list.append({'Site_ID': site_id, 'LY_Avg_Energy_kWh': site_avg_total})
-            else:
-                data_list.append({'Site_ID': site_id, 'LY_Avg_Energy_kWh': np.nan})
+            return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': site_avg_total if has_data else np.nan}
+        return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': np.nan}
+
+    data_list = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(fetch_single, row) for _, row in df_sites_to_scan.iterrows()]
+        for future in as_completed(futures):
+            data_list.append(future.result())
             
     return pd.DataFrame(data_list)
 
 def get_capacity_from_model(model_name):
-    if not model_name:
-        return 1.0 
+    if not model_name: return 1.0 
     match = re.search(r'SE(\d+(?:\.\d+)?)', model_name, re.IGNORECASE)
-    if match:
-        return float(match.group(1))
+    if match: return float(match.group(1))
     return 1.0 
 
 def get_inverter_diagnosis(row, target_date):
@@ -231,10 +236,9 @@ def get_inverter_diagnosis(row, target_date):
     if portal == 'VCOM':
         return "VCOM: AI Diagnosis in development"
         
-    # --- SolarEdge Logic ---
     equip_url = f"{BASE_URL}/equipment/{site_id}/list?api_key={API_KEY}"
     try:
-        res = requests.get(equip_url, timeout=10)
+        res = global_http_session.get(equip_url, timeout=10)
         if res.status_code != 200: return "API Error"
         
         inverters = [eq for eq in res.json().get('reporters', {}).get('list', []) if 'inverter' in eq.get('name', '').lower() or eq.get('type', '') == 'Inverter']
@@ -244,34 +248,28 @@ def get_inverter_diagnosis(row, target_date):
         for inv in inverters:
             sn = inv.get('serialNumber')
             name = inv.get('name', sn)
-            model = inv.get('model', '')
-            capacity_kw = get_capacity_from_model(model)
+            capacity_kw = get_capacity_from_model(inv.get('model', ''))
             
             data_url = f"{BASE_URL}/equipment/{site_id}/{sn}/data?startTime={target_date} 00:00:00&endTime={target_date} 23:59:59&api_key={API_KEY}"
-            d_res = requests.get(data_url, timeout=10)
+            d_res = global_http_session.get(data_url, timeout=10)
             inv_energy = 0
             if d_res.status_code == 200:
                 energies = [t.get('totalEnergy') for t in d_res.json().get('data', {}).get('telemetries', []) if t.get('totalEnergy') is not None]
                 if energies: inv_energy = (max(energies) - min(energies)) / 1000
             
-            specific_yield = inv_energy / capacity_kw if capacity_kw > 0 else 0
-            
             inverter_data[name] = {
                 'energy': inv_energy,
                 'capacity': capacity_kw,
-                'specific_yield': specific_yield
+                'specific_yield': inv_energy / capacity_kw if capacity_kw > 0 else 0
             }
-            time.sleep(0.1) 
             
         if not any(d['energy'] > 0 for d in inverter_data.values()): 
             return "Site Offline: All inverters at 0 kWh"
             
         max_specific_yield = max([d['specific_yield'] for d in inverter_data.values()])
-        
         faults = []
         for name, data in inverter_data.items():
             cap_label = f"[{data['capacity']:g}kW]" if data['capacity'] > 0 else ""
-            
             if data['energy'] == 0:
                 faults.append(f"{name} {cap_label}: 0 kWh")
             elif data['specific_yield'] < (max_specific_yield * 0.75): 
@@ -280,7 +278,6 @@ def get_inverter_diagnosis(row, target_date):
         return "Faults: " + " | ".join(faults) if faults else "Inverters balanced. Check Shading/Soiling."
     except:
         return "Diagnosis Failed"
-
 
 # --- ממשק המשתמש (UI) ---
 st.title("☀️ Solar Monitor - AI Hit List")
@@ -298,21 +295,15 @@ with st.sidebar:
     
     if not df_sites.empty:
         site_options = sorted(df_sites['Name'].tolist())
-        selected_sites = st.multiselect(
-            "Select specific sites to scan (optional):", 
-            options=site_options,
-            help="If you select sites here, the scanner will ignore the bulk settings below and ONLY scan these sites."
-        )
+        selected_sites = st.multiselect("Select specific sites to scan (optional):", options=site_options)
         
         st.divider()
-        
         scan_mode = None
         scan_limit = 0
         
         if not selected_sites:
             st.subheader("🗂️ Bulk Scan Options")
             total_sites = len(df_sites)
-            
             scan_mode = st.radio(
                 "Select portfolio to scan:",
                 options=[
@@ -323,15 +314,13 @@ with st.sidebar:
                     f"⚠️ Scan ALL ({total_sites} sites - High Timeout Risk)"
                 ]
             )
-            
             if scan_mode == "🧪 Test Mode (Custom Sample)":
                 scan_limit = st.number_input(f"Number of Sites to Scan (Max: {total_sites})", min_value=1, max_value=total_sites if total_sites > 0 else 1, value=min(20, total_sites), step=10)
     
     run_button = st.button("🚀 Run Anomaly Detection", use_container_width=True, type="primary")
 
 if run_button:
-    if df_sites.empty:
-        st.stop()
+    if df_sites.empty: st.stop()
         
     if selected_sites:
         sites_to_scan = df_sites[df_sites['Name'].isin(selected_sites)].copy()
@@ -352,15 +341,15 @@ if run_button:
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    status_text.text(f"1/5: Fetching Daily Energy for {len(sites_to_scan)} sites...")
+    status_text.text(f"1/5: Fetching Daily Energy for {len(sites_to_scan)} sites (Turbo Mode)...")
     df_daily = get_daily_site_energy(sites_to_scan, target_date_str)
     progress_bar.progress(20)
     
-    status_text.text("2/5: Fetching 7-Day Trend...")
+    status_text.text("2/5: Fetching 7-Day Trend (Turbo Mode)...")
     df_7d = get_7_day_baseline(sites_to_scan, target_date_str)
     progress_bar.progress(40)
     
-    status_text.text("3/5: Fetching YoY Baseline...")
+    status_text.text("3/5: Fetching YoY Baseline (Turbo Mode)...")
     df_yoy = get_yoy_baseline(sites_to_scan, target_date_str)
     progress_bar.progress(60)
     
