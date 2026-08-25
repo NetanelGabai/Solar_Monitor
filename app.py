@@ -5,6 +5,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import time
 import re
+import random # הוספנו עבור מנגנון ה-Jitter
 from requests.auth import HTTPBasicAuth
 from concurrent.futures import ThreadPoolExecutor, as_completed 
 
@@ -34,14 +35,15 @@ global_http_session = requests.Session()
 vcom_inverters_cache = {} 
 
 def vcom_request_with_retry(url, auth, headers, params=None):
-    """מנגנון חכם שמונע מה-API של VCOM לחסום אותנו ומוודא שכל הממירים נמשכים"""
+    """מנגנון חכם עם Jitter למניעת פקקי תנועה והאצת השליפות"""
     for attempt in range(5): 
         try:
             res = global_http_session.get(url, auth=auth, headers=headers, params=params, timeout=15)
             if res.status_code == 200:
                 return res
             elif res.status_code == 429: 
-                time.sleep(2 * (attempt + 1)) 
+                # Jitter: מוסיף זמן המתנה אקראי כדי למנוע התנפלות של כל ה-Threads יחד
+                time.sleep((2 * (attempt + 1)) + random.uniform(0.1, 1.5)) 
                 continue
         except:
             pass
@@ -118,7 +120,8 @@ def get_daily_site_energy(df_sites_to_scan, target_date_str):
         return {'Site_ID': site_id, 'Energy_kWh': np.nan}
 
     energy_data = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    # הועלה חזרה ל-10 פועלים כדי לסיים 250 אתרים במהירות
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(fetch_single, row) for _, row in df_sites_to_scan.iterrows()]
         for future in as_completed(futures):
             energy_data.append(future.result())
@@ -167,7 +170,7 @@ def get_7_day_baseline(df_sites_to_scan, target_date_str):
         return {'Site_ID': site_id, '7D_Avg_Energy_kWh': np.nan}
 
     data_list = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(fetch_single, row) for _, row in df_sites_to_scan.iterrows()]
         for future in as_completed(futures):
             data_list.append(future.result())
@@ -218,7 +221,7 @@ def get_yoy_baseline(df_sites_to_scan, current_date_str):
         return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': np.nan}
 
     data_list = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(fetch_single, row) for _, row in df_sites_to_scan.iterrows()]
         for future in as_completed(futures):
             data_list.append(future.result())
@@ -242,10 +245,38 @@ def get_inverter_diagnosis(row, target_date):
         inverters = get_vcom_inverters(site_id, auth, headers)
         if not inverters: return "No inverters found"
         
+        faults = []
+        
+        # 1. שלב חדש: בדיקת תפוקה גלובלית לכל ממיר (E_DAY)
+        inv_energies = {}
+        day_start = f"{target_date}T00:00:00+03:00"
+        day_end = f"{target_date}T23:59:59+03:00"
+        
+        for inv_id, inv_name in inverters.items():
+            meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
+            meas_res = vcom_request_with_retry(meas_url, auth=auth, headers=headers, params={"from": day_start, "to": day_end, "resolution": "day"})
+            if meas_res:
+                data = meas_res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
+                valid_vals = [d['value'] for d in data if d.get('value') is not None and d.get('value') > 0]
+                if valid_vals:
+                    inv_energies[inv_name] = max(valid_vals) # max of E_DAY yields the total for that day
+                else:
+                    inv_energies[inv_name] = 0.0
+            else:
+                inv_energies[inv_name] = 0.0
+                
+        # 2. השוואת התפוקות היומיות בין הממירים (דומה לסולאראדג')
+        max_inv_energy = max(inv_energies.values()) if inv_energies else 0
+        for name, energy in inv_energies.items():
+            if energy == 0:
+                faults.append(f"{name}: 0 kWh")
+            elif max_inv_energy > 0 and energy < (max_inv_energy * 0.75):
+                faults.append(f"{name}: Low Output ({energy:.1f} kWh vs max {max_inv_energy:.1f} kWh)")
+
+        # 3. שלב הסטרינגים: צלילה ל-DC (לחלון צהריים)
         start_time = f"{target_date}T11:00:00+03:00"
         end_time = f"{target_date}T13:00:00+03:00"
         
-        faults = []
         for inv_id, inv_name in inverters.items():
             abbr_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations"
             abbr_res = vcom_request_with_retry(abbr_url, auth=auth, headers=headers)
@@ -280,7 +311,7 @@ def get_inverter_diagnosis(row, target_date):
                 elif inv_median_current > 2.0 and current < (inv_median_current * 0.6): 
                     faults.append(f"{inv_name} ({abbr}): Low Current ({current:.1f}A vs avg {inv_median_current:.1f}A)")
                     
-        return "Faults: " + " | ".join(faults) if faults else "Inverters DC balanced. Check Shading/Soiling."
+        return "Faults: " + " | ".join(set(faults)) if faults else "Inverters balanced. Check Shading/Soiling."
         
     elif portal == 'SolarEdge':
         equip_url = f"{BASE_URL}/equipment/{site_id}/list?api_key={API_KEY}"
@@ -439,11 +470,11 @@ if run_button:
     total_sites_count = len(sites_to_deep_scan)
     completed_scans = 0
     
-    # --- התיקון הקריטי: עיבוד מקבילי גם לשלב הדיאגנוסטיקה ---
     def fetch_diagnosis(row):
         return row['Site_ID'], get_inverter_diagnosis(row, target_date_str)
         
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    # גם השלב הדיאגנוסטי מואץ ל-10 פועלים
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(fetch_diagnosis, row) for _, row in sites_to_deep_scan.iterrows()]
         for future in as_completed(futures):
             site_id, diagnosis_result = future.result()
