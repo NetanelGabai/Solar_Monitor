@@ -422,8 +422,8 @@ if run_button:
         st.dataframe(
             display_df.style
             .format({
-                'Yield (kWh/kWp)': '{:.2f}',
-                'Area Median (kWh/kWp)': '{:.2f}'
+                'Yield (kWh/kWp)': lambda x: f"{x:.2f}" if isinstance(x, (int, float)) else x,
+                'Area Median (kWh/kWp)': lambda x: f"{x:.2f}" if isinstance(x, (int, float)) else x
             })
             .apply(highlight_offline, axis=1),
             use_container_width=True,
