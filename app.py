@@ -34,18 +34,18 @@ global_http_session = requests.Session()
 vcom_inverters_cache = {} 
 
 def vcom_request_with_retry(url, auth, headers, params=None):
-    """מנגנון חכם שמונע מה-API של VCOM לחסום אותנו על עומס בקשות"""
-    for attempt in range(4): # מנסה עד 4 פעמים
+    """מנגנון חכם שמונע מה-API של VCOM לחסום אותנו ומוודא שכל הממירים נמשכים"""
+    for attempt in range(5): # מנסה עד 5 פעמים כדי לא לפספס ממירים
         try:
             res = global_http_session.get(url, auth=auth, headers=headers, params=params, timeout=15)
             if res.status_code == 200:
                 return res
             elif res.status_code == 429: # חסימת קצב (Too Many Requests)
-                time.sleep(2 * (attempt + 1)) # ממתין 2, 4, 6 שניות בהתאמה
+                time.sleep(2 * (attempt + 1)) # המתנה מתארכת
                 continue
         except:
             pass
-        time.sleep(1) # השהיה קלה במקרה של נפילת רשת
+        time.sleep(1) # במקרה של שגיאת רשת זמנית
     return None
 
 def get_vcom_auth(account_name):
@@ -81,8 +81,8 @@ def load_metadata():
         return pd.DataFrame()
 
 def get_daily_site_energy(df_sites_to_scan, target_date_str):
-    vcom_start = f"{target_date_str}T00:00:00Z"
-    vcom_end = f"{target_date_str}T23:59:59Z"
+    vcom_start = f"{target_date_str}T00:00:00+03:00"
+    vcom_end = f"{target_date_str}T23:59:59+03:00"
     
     def fetch_single(row):
         site_id = str(row['Site_ID'])
@@ -118,7 +118,6 @@ def get_daily_site_energy(df_sites_to_scan, target_date_str):
         return {'Site_ID': site_id, 'Energy_kWh': np.nan}
 
     energy_data = []
-    # הורדנו ל-5 עובדים במקביל כדי לא לעצבן את שרת VCOM
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(fetch_single, row) for _, row in df_sites_to_scan.iterrows()]
         for future in as_completed(futures):
@@ -129,8 +128,8 @@ def get_daily_site_energy(df_sites_to_scan, target_date_str):
 def get_7_day_baseline(df_sites_to_scan, target_date_str):
     target_date = datetime.strptime(target_date_str, '%Y-%m-%d')
     start_date_str = (target_date - timedelta(days=7)).strftime('%Y-%m-%d')
-    vcom_start = f"{start_date_str}T00:00:00Z"
-    vcom_end = f"{target_date_str}T23:59:59Z"
+    vcom_start = f"{start_date_str}T00:00:00+03:00"
+    vcom_end = f"{target_date_str}T23:59:59+03:00"
     
     def fetch_single(row):
         site_id = str(row['Site_ID'])
@@ -180,8 +179,8 @@ def get_yoy_baseline(df_sites_to_scan, current_date_str):
     ly_end = current_date.replace(year=current_date.year - 1)
     ly_start_str = (ly_end - timedelta(days=14)).strftime('%Y-%m-%d')
     ly_end_str = ly_end.strftime('%Y-%m-%d')
-    vcom_start = f"{ly_start_str}T00:00:00Z"
-    vcom_end = f"{ly_end_str}T23:59:59Z"
+    vcom_start = f"{ly_start_str}T00:00:00+03:00"
+    vcom_end = f"{ly_end_str}T23:59:59+03:00"
     
     def fetch_single(row):
         site_id = str(row['Site_ID'])
