@@ -39,13 +39,12 @@ global_http_session = requests.Session()
 vcom_inverters_cache = {} 
 
 def request_with_retry(url, auth=None, headers=None, params=None):
-    """מנגנון חכם ואחיד לכל סוגי ה-API למניעת שגיאות זמניות וחסימות"""
     for attempt in range(5): 
         try:
             res = global_http_session.get(url, auth=auth, headers=headers, params=params, timeout=15)
             if res.status_code == 200:
                 if "meteocontrol" in url:
-                    time.sleep(VCOM_MICRO_DELAY) # הרמזור חל רק על VCOM
+                    time.sleep(VCOM_MICRO_DELAY) 
                 return res
             elif res.status_code == 429: 
                 time.sleep((2 * (attempt + 1)) + random.uniform(0.1, 1.0)) 
@@ -73,7 +72,6 @@ def get_vcom_inverters(site_id, auth, headers):
     return {}
 
 def fetch_vcom_system_energy(site_id, auth, headers, start_dt, end_dt):
-    """ שליפה מהירה ברמת המערכת """
     meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/abbreviations/E_DAY/measurements"
     res = request_with_retry(meas_url, auth=auth, headers=headers, params={"from": start_dt, "to": end_dt, "resolution": "day"})
     if res and res.status_code == 200:
@@ -88,7 +86,6 @@ def fetch_vcom_system_energy(site_id, auth, headers, start_dt, end_dt):
     return None
 
 def fetch_vcom_inverter_e_day(site_id, inv_id, auth, headers, start_dt, end_dt):
-    """ פונקציית עזר למניעת שכפול קוד בשליפת תפוקת ממיר """
     url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
     res = request_with_retry(url, auth=auth, headers=headers, params={"from": start_dt, "to": end_dt, "resolution": "day"})
     if res:
@@ -100,10 +97,10 @@ def fetch_vcom_inverter_e_day(site_id, inv_id, auth, headers, start_dt, end_dt):
 @st.cache_data(ttl=3600)
 def load_metadata():
     try:
-        df = pd.read_csv('sites_metadata.csv', encoding='utf-8-sig') # תמיכה בטוחה יותר בעברית
+        df = pd.read_csv('sites_metadata.csv', encoding='utf-8-sig') 
         df = df[~df['Name'].str.contains(r'DELETED|DISABLED|\*|^Z\s*-', na=False, case=False)]
         df = df.dropna(subset=['Latitude', 'Longitude'])
-        df['Capacity_kWp'] = pd.to_numeric(df['Capacity_kWp'], errors='coerce') # המרה בטוחה
+        df['Capacity_kWp'] = pd.to_numeric(df['Capacity_kWp'], errors='coerce') 
         df = df[df['Capacity_kWp'] > 0]
         if 'Portal' not in df.columns: df['Portal'] = 'SolarEdge'
         if 'Account_Name' not in df.columns: df['Account_Name'] = ''
@@ -134,17 +131,41 @@ def get_inverter_diagnosis(row, target_date):
         day_start = f"{target_date}T00:00:00+03:00"
         day_end = f"{target_date}T23:59:59+03:00"
         
+        # 1. שליפה חכמה של נתון מנורמל ונתון אבסולוטי בו זמנית
         for inv_id, inv_name in inverters.items():
-            valid_vals = fetch_vcom_inverter_e_day(site_id, inv_id, auth, headers, day_start, day_end)
-            inv_energies[inv_name] = max(valid_vals) if valid_vals else 0.0
+            abbr_str = "E_INT_N,E_DAY"
+            meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/{abbr_str}/measurements"
+            meas_res = request_with_retry(meas_url, auth=auth, headers=headers, params={"from": day_start, "to": day_end, "resolution": "day"})
+            
+            norm_val, abs_val = 0.0, 0.0
+            if meas_res and meas_res.status_code == 200:
+                data = meas_res.json().get('data', {}).get(inv_id, {})
                 
-        max_inv_energy = max(inv_energies.values()) if inv_energies else 0
-        for name, energy in inv_energies.items():
+                norm_data = data.get('E_INT_N', [])
+                valid_norm = [d['value'] for d in norm_data if d.get('value') is not None and d.get('value') > 0]
+                if valid_norm: norm_val = max(valid_norm)
+                
+                abs_data = data.get('E_DAY', [])
+                valid_abs = [d['value'] for d in abs_data if d.get('value') is not None and d.get('value') > 0]
+                if valid_abs: abs_val = max(valid_abs)
+                
+            inv_energies[inv_name] = {'norm': norm_val, 'abs': abs_val}
+            
+        # 2. החלטה האם להשוות באופן מנורמל או אבסולוטי (גיבוי)
+        use_normalized = all(v['norm'] > 0 for v in inv_energies.values()) if inv_energies else False
+        
+        comparison_dict = {name: (v['norm'] if use_normalized else v['abs']) for name, v in inv_energies.items()}
+        max_energy = max(comparison_dict.values()) if comparison_dict else 0
+        
+        unit = "kWh/kWp" if use_normalized else "kWh"
+        
+        for name, energy in comparison_dict.items():
             if energy == 0:
-                faults.append(f"{name}: 0 kWh")
-            elif max_inv_energy > 0 and energy < (max_inv_energy * 0.75):
-                faults.append(f"{name}: Low Output ({energy:.1f} kWh vs max {max_inv_energy:.1f} kWh)")
+                faults.append(f"{name}: 0 {unit}")
+            elif max_energy > 0 and energy < (max_energy * 0.75):
+                faults.append(f"{name}: Low Output ({energy:.2f} vs max {max_energy:.2f} {unit})")
 
+        # 3. בדיקת זרמי ה-DC לסטרינגים (שעות צהריים)
         start_time = f"{target_date}T11:00:00+03:00"
         end_time = f"{target_date}T13:00:00+03:00"
         
@@ -204,7 +225,7 @@ def get_inverter_diagnosis(row, target_date):
                 inv_energy = 0
                 if d_res and d_res.status_code == 200:
                     energies = [t.get('totalEnergy') for t in d_res.json().get('data', {}).get('telemetries', []) if t.get('totalEnergy') is not None]
-                    if energies: inv_energy = (max(energies) - min(energies)) / 1000 # סולאראדג' ציוד מחזיר ב-Wh
+                    if energies: inv_energy = (max(energies) - min(energies)) / 1000 
                 
                 inverter_data[name] = {
                     'energy': inv_energy,
@@ -306,7 +327,7 @@ if run_button:
                 res = request_with_retry(url)
                 if res and res.status_code == 200:
                     val = res.json()['energy']['values'][0]['value']
-                    return {'Site_ID': site_id, 'Energy_kWh': val / 1000 if val is not None else 0} # המרה מיידית ל-kWh
+                    return {'Site_ID': site_id, 'Energy_kWh': val / 1000 if val is not None else 0} 
             except: pass
             return {'Site_ID': site_id, 'Energy_kWh': np.nan}
             
@@ -315,7 +336,7 @@ if run_button:
             if auth:
                 system_vals = fetch_vcom_system_energy(site_id, auth, headers, vcom_start, vcom_end)
                 if system_vals:
-                    return {'Site_ID': site_id, 'Energy_kWh': max(system_vals)} # כבר ב-kWh
+                    return {'Site_ID': site_id, 'Energy_kWh': max(system_vals)} 
                 
                 site_energy_total = 0.0
                 has_data = False
@@ -447,7 +468,6 @@ if run_button:
     df_master = pd.merge(df_master, df_yoy, on='Site_ID', how='left')
     df_master = pd.merge(df_master, df_7d, on='Site_ID', how='left')
     
-    # הסרנו את החלוקה הכפולה השבירה - הנתונים כבר ב-kWh
     df_master['Specific_Yield'] = df_master['Energy_kWh'] / df_master['Capacity_kWp']
     df_master['LY_Avg_Yield'] = df_master['LY_Avg_Energy_kWh'] / df_master['Capacity_kWp']
     df_master['7D_Avg_Yield'] = df_master['7D_Avg_Energy_kWh'] / df_master['Capacity_kWp']
