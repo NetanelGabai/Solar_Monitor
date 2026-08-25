@@ -35,17 +35,17 @@ vcom_inverters_cache = {}
 
 def vcom_request_with_retry(url, auth, headers, params=None):
     """מנגנון חכם שמונע מה-API של VCOM לחסום אותנו ומוודא שכל הממירים נמשכים"""
-    for attempt in range(5): # מנסה עד 5 פעמים כדי לא לפספס ממירים
+    for attempt in range(5): 
         try:
             res = global_http_session.get(url, auth=auth, headers=headers, params=params, timeout=15)
             if res.status_code == 200:
                 return res
-            elif res.status_code == 429: # חסימת קצב (Too Many Requests)
-                time.sleep(2 * (attempt + 1)) # המתנה מתארכת
+            elif res.status_code == 429: 
+                time.sleep(2 * (attempt + 1)) 
                 continue
         except:
             pass
-        time.sleep(1) # במקרה של שגיאת רשת זמנית
+        time.sleep(1) 
     return None
 
 def get_vcom_auth(account_name):
@@ -60,10 +60,11 @@ def get_vcom_inverters(site_id, auth, headers):
         
     res = vcom_request_with_retry(f"{VCOM_BASE_URL}/systems/{site_id}/inverters", auth=auth, headers=headers)
     if res and res.status_code == 200:
-        inverters = [str(inv['id']) for inv in res.json().get('data', [])]
+        # עכשיו אנחנו שומרים מילון של {מזהה: שם_ממיר} במקום רק רשימת מזהים
+        inverters = {str(inv['id']): inv.get('name', str(inv['id'])) for inv in res.json().get('data', [])}
         vcom_inverters_cache[site_id] = inverters
         return inverters
-    return []
+    return {}
 
 # --- פונקציות מנוע החוקים ---
 @st.cache_data(ttl=3600)
@@ -105,7 +106,7 @@ def get_daily_site_energy(df_sites_to_scan, target_date_str):
             has_data = False
             if auth:
                 inverters = get_vcom_inverters(site_id, auth, headers)
-                for inv_id in inverters:
+                for inv_id in inverters: # איטרציה על המפתחות של המילון
                     meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
                     meas_res = vcom_request_with_retry(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"})
                     if meas_res:
@@ -236,50 +237,101 @@ def get_inverter_diagnosis(row, target_date):
     portal = row.get('Portal', 'SolarEdge')
     
     if portal == 'VCOM':
-        return "VCOM: AI Diagnosis in development"
+        auth, headers = get_vcom_auth(row['Account_Name'])
+        if not auth: return "VCOM Auth Error"
         
-    equip_url = f"{BASE_URL}/equipment/{site_id}/list?api_key={API_KEY}"
-    try:
-        res = global_http_session.get(equip_url, timeout=15)
-        if res.status_code != 200: return "API Error"
-        
-        inverters = [eq for eq in res.json().get('reporters', {}).get('list', []) if 'inverter' in eq.get('name', '').lower() or eq.get('type', '') == 'Inverter']
+        inverters = get_vcom_inverters(site_id, auth, headers)
         if not inverters: return "No inverters found"
-            
-        inverter_data = {}
-        for inv in inverters:
-            sn = inv.get('serialNumber')
-            name = inv.get('name', sn)
-            capacity_kw = get_capacity_from_model(inv.get('model', ''))
-            
-            data_url = f"{BASE_URL}/equipment/{site_id}/{sn}/data?startTime={target_date} 00:00:00&endTime={target_date} 23:59:59&api_key={API_KEY}"
-            d_res = global_http_session.get(data_url, timeout=15)
-            inv_energy = 0
-            if d_res.status_code == 200:
-                energies = [t.get('totalEnergy') for t in d_res.json().get('data', {}).get('telemetries', []) if t.get('totalEnergy') is not None]
-                if energies: inv_energy = (max(energies) - min(energies)) / 1000
-            
-            inverter_data[name] = {
-                'energy': inv_energy,
-                'capacity': capacity_kw,
-                'specific_yield': inv_energy / capacity_kw if capacity_kw > 0 else 0
-            }
-            
-        if not any(d['energy'] > 0 for d in inverter_data.values()): 
-            return "Site Offline: All inverters at 0 kWh"
-            
-        max_specific_yield = max([d['specific_yield'] for d in inverter_data.values()])
+        
+        # חלון זמן דיאגנוסטיקה (צהריים, שעון ישראל) כדי לבדוק זרם נקי ובולט
+        start_time = f"{target_date}T11:00:00+03:00"
+        end_time = f"{target_date}T13:00:00+03:00"
+        
         faults = []
-        for name, data in inverter_data.items():
-            cap_label = f"[{data['capacity']:g}kW]" if data['capacity'] > 0 else ""
-            if data['energy'] == 0:
-                faults.append(f"{name} {cap_label}: 0 kWh")
-            elif data['specific_yield'] < (max_specific_yield * 0.75): 
-                faults.append(f"{name} {cap_label}: Low Output ({data['energy']:.1f} kWh)")
+        for inv_id, inv_name in inverters.items():
+            # 1. אילו חיישנים קיימים בממיר?
+            abbr_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations"
+            abbr_res = vcom_request_with_retry(abbr_url, auth=auth, headers=headers)
+            if not abbr_res: continue
+            
+            # שליפת החיישנים שמתחילים ב-I_DC (זרם ישר)
+            available_abbrs = abbr_res.json().get('data', [])
+            dc_abbrs = [abbr for abbr in available_abbrs if abbr.startswith('I_DC')]
+            
+            if not dc_abbrs: continue
+            
+            # 2. שליפת הזרמים לכל הסטרינגים במכה אחת לשעות הצהריים
+            abbr_str = ",".join(dc_abbrs)
+            meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/{abbr_str}/measurements"
+            meas_res = vcom_request_with_retry(meas_url, auth=auth, headers=headers, params={"from": start_time, "to": end_time, "resolution": "15min"})
+            
+            if not meas_res: continue
+            
+            data = meas_res.json().get('data', {}).get(inv_id, {})
+            string_medians = {}
+            
+            for abbr in dc_abbrs:
+                measurements = data.get(abbr, [])
+                vals = [m['value'] for m in measurements if m.get('value') is not None]
+                string_medians[abbr] = np.median(vals) if vals else 0.0
                 
-        return "Faults: " + " | ".join(faults) if faults else "Inverters balanced. Check Shading/Soiling."
-    except:
-        return "Diagnosis Failed"
+            if not string_medians: continue
+            
+            # 3. לוגיקת האנומליות - השוואת הסטרינגים הפנימיים
+            inv_median_current = np.median(list(string_medians.values()))
+            
+            for abbr, current in string_medians.items():
+                if current < 0.5: # זרם אפסי
+                    faults.append(f"{inv_name} ({abbr}): 0A (Suspected Open String/Blown Fuse)")
+                elif inv_median_current > 2.0 and current < (inv_median_current * 0.6): # ירידה של מעל 40%
+                    faults.append(f"{inv_name} ({abbr}): Low Current ({current:.1f}A vs avg {inv_median_current:.1f}A)")
+                    
+        return "Faults: " + " | ".join(faults) if faults else "Inverters DC balanced. Check Shading/Soiling."
+        
+    elif portal == 'SolarEdge':
+        # --- הלוגיקה המקורית והשמורה של סולאראדג' ---
+        equip_url = f"{BASE_URL}/equipment/{site_id}/list?api_key={API_KEY}"
+        try:
+            res = global_http_session.get(equip_url, timeout=15)
+            if res.status_code != 200: return "API Error"
+            
+            inverters = [eq for eq in res.json().get('reporters', {}).get('list', []) if 'inverter' in eq.get('name', '').lower() or eq.get('type', '') == 'Inverter']
+            if not inverters: return "No inverters found"
+                
+            inverter_data = {}
+            for inv in inverters:
+                sn = inv.get('serialNumber')
+                name = inv.get('name', sn)
+                capacity_kw = get_capacity_from_model(inv.get('model', ''))
+                
+                data_url = f"{BASE_URL}/equipment/{site_id}/{sn}/data?startTime={target_date} 00:00:00&endTime={target_date} 23:59:59&api_key={API_KEY}"
+                d_res = global_http_session.get(data_url, timeout=15)
+                inv_energy = 0
+                if d_res.status_code == 200:
+                    energies = [t.get('totalEnergy') for t in d_res.json().get('data', {}).get('telemetries', []) if t.get('totalEnergy') is not None]
+                    if energies: inv_energy = (max(energies) - min(energies)) / 1000
+                
+                inverter_data[name] = {
+                    'energy': inv_energy,
+                    'capacity': capacity_kw,
+                    'specific_yield': inv_energy / capacity_kw if capacity_kw > 0 else 0
+                }
+                
+            if not any(d['energy'] > 0 for d in inverter_data.values()): 
+                return "Site Offline: All inverters at 0 kWh"
+                
+            max_specific_yield = max([d['specific_yield'] for d in inverter_data.values()])
+            faults = []
+            for name, data in inverter_data.items():
+                cap_label = f"[{data['capacity']:g}kW]" if data['capacity'] > 0 else ""
+                if data['energy'] == 0:
+                    faults.append(f"{name} {cap_label}: 0 kWh")
+                elif data['specific_yield'] < (max_specific_yield * 0.75): 
+                    faults.append(f"{name} {cap_label}: Low Output ({data['energy']:.1f} kWh)")
+                    
+            return "Faults: " + " | ".join(faults) if faults else "Inverters balanced. Check Shading/Soiling."
+        except:
+            return "Diagnosis Failed"
 
 # --- ממשק המשתמש (UI) ---
 st.title("☀️ Solar Monitor - AI Hit List")
@@ -404,7 +456,7 @@ if run_button:
         (df_master['Performance_vs_Cluster'] < 0.80) | 
         (df_master['7D_Change_%'] < -10.0) | 
         (df_master['YoY_Change_%'] < -20.0) |
-        (df_master['System_Diagnosis'].str.contains('0 kWh|Low Output|Offline|Faults', na=False, regex=True)), 
+        (df_master['System_Diagnosis'].str.contains('0 kWh|0A|Low Current|Low Output|Offline|Faults', na=False, regex=True)), 
         '🔴 Fault Suspected', 
         '🟢 OK'
     )
@@ -453,7 +505,7 @@ if run_button:
         }, inplace=True)
         
         def highlight_offline(s):
-            if 'Offline' in str(s.get('AI Diagnosis', '')): 
+            if 'Offline' in str(s.get('AI Diagnosis', '')) or '0A' in str(s.get('AI Diagnosis', '')): 
                 return ['background-color: #4a1c1c; color: #ffcccc'] * len(s)
             elif 'Fault Suspected' in str(s.get('Status', '')):
                 return ['background-color: #331a00'] * len(s) 
