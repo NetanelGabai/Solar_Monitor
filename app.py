@@ -28,21 +28,22 @@ VCOM_CREDENTIALS = {
     }
 }
 
-# --- פונקציות עזר (Auth) ---
+# --- פונקציות עזר (Auth & Inverters) ---
 def get_vcom_auth(account_name):
     if account_name in VCOM_CREDENTIALS:
         creds = VCOM_CREDENTIALS[account_name]
         return HTTPBasicAuth(account_name, creds['PASSWORD']), {"X-API-KEY": creds['API_KEY'], "Accept": "application/json"}
     return None, None
 
-def get_vcom_first_inverter(site_id, auth, headers):
+def get_vcom_inverters(site_id, auth, headers):
+    """מושך את רשימת כל הממירים באתר VCOM"""
     try:
         inv_res = requests.get(f"{VCOM_BASE_URL}/systems/{site_id}/inverters", auth=auth, headers=headers, timeout=10)
-        if inv_res.status_code == 200 and inv_res.json().get('data'):
-            return inv_res.json()['data'][0]['id']
+        if inv_res.status_code == 200:
+            return [str(inv['id']) for inv in inv_res.json().get('data', [])]
     except:
         pass
-    return None
+    return []
 
 # --- פונקציות מנוע החוקים ---
 @st.cache_data(ttl=3600)
@@ -52,7 +53,6 @@ def load_metadata():
         df = df[~df['Name'].str.contains(r'DELETED|DISABLED|\*|^Z\s*-', na=False, case=False)]
         df = df.dropna(subset=['Latitude', 'Longitude'])
         df = df[df['Capacity_kWp'] > 0]
-        # השלמת עמודות במקרה של קובץ ישן
         if 'Portal' not in df.columns: df['Portal'] = 'SolarEdge'
         if 'Account_Name' not in df.columns: df['Account_Name'] = ''
         return df
@@ -76,35 +76,45 @@ def get_daily_site_energy(df_sites_to_scan, target_date_str):
                 if res.status_code == 200:
                     val = res.json()['energy']['values'][0]['value']
                     energy_data.append({'Site_ID': site_id, 'Energy_kWh': 0 if val is None else val})
+                    continue
             except:
-                energy_data.append({'Site_ID': site_id, 'Energy_kWh': np.nan})
+                pass
+            energy_data.append({'Site_ID': site_id, 'Energy_kWh': np.nan})
                 
         elif portal == 'VCOM':
             auth, headers = get_vcom_auth(row['Account_Name'])
+            has_data = False
+            site_energy_total = 0.0
+            
             if auth:
-                inv_id = get_vcom_first_inverter(site_id, auth, headers)
-                if inv_id:
+                inverters = get_vcom_inverters(site_id, auth, headers)
+                for inv_id in inverters:
                     meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
                     try:
                         meas_res = requests.get(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"}, timeout=10)
                         if meas_res.status_code == 200:
-                            data = meas_res.json().get('data', [])
-                            if data and data[0].get('value') is not None:
-                                # VCOM מחזיר ב-kWh, סולאראדג' ב-Wh. נכפיל כדי שהלוגיקה הראשית שמחלקת ב-1000 תעבוד לשניהם.
-                                val = data[0]['value'] * 1000 
-                                energy_data.append({'Site_ID': site_id, 'Energy_kWh': val})
-                                continue
+                            # פנייה נכונה למבנה ה-JSON של VCOM למדידות
+                            data = meas_res.json().get(inv_id, {}).get('E_DAY', [])
+                            valid_vals = [d['value'] for d in data if d.get('value') is not None]
+                            if valid_vals:
+                                # לוקחים את המקסימום מבין הדגימות של אותו יום כדי לקבל את הסך היומי
+                                site_energy_total += max(valid_vals) * 1000 
+                                has_data = True
                     except:
                         pass
-            energy_data.append({'Site_ID': site_id, 'Energy_kWh': np.nan})
-            
+                    time.sleep(0.1) # מניעת חסימות מול VCOM
+                    
+            if has_data:
+                energy_data.append({'Site_ID': site_id, 'Energy_kWh': site_energy_total})
+            else:
+                energy_data.append({'Site_ID': site_id, 'Energy_kWh': np.nan})
+                
     return pd.DataFrame(energy_data)
 
 def get_7_day_baseline(df_sites_to_scan, target_date_str):
     target_date = datetime.strptime(target_date_str, '%Y-%m-%d')
     start_date_str = (target_date - timedelta(days=7)).strftime('%Y-%m-%d')
     data_list = []
-    
     vcom_start = f"{start_date_str}T00:00:00Z"
     vcom_end = f"{target_date_str}T23:59:59Z"
     
@@ -120,25 +130,37 @@ def get_7_day_baseline(df_sites_to_scan, target_date_str):
                     vals = [v['value'] for v in res.json().get('energy', {}).get('values', []) if v.get('value') is not None]
                     avg = sum(vals)/len(vals) if vals else np.nan
                     data_list.append({'Site_ID': site_id, '7D_Avg_Energy_kWh': avg / 1000 if not np.isnan(avg) else np.nan})
+                    continue
             except:
-                data_list.append({'Site_ID': site_id, '7D_Avg_Energy_kWh': np.nan})
+                pass
+            data_list.append({'Site_ID': site_id, '7D_Avg_Energy_kWh': np.nan})
                 
         elif portal == 'VCOM':
             auth, headers = get_vcom_auth(row['Account_Name'])
+            has_data = False
+            site_avg_total = 0.0
+            
             if auth:
-                inv_id = get_vcom_first_inverter(site_id, auth, headers)
-                if inv_id:
+                inverters = get_vcom_inverters(site_id, auth, headers)
+                for inv_id in inverters:
                     meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
                     try:
                         meas_res = requests.get(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"}, timeout=10)
                         if meas_res.status_code == 200:
-                            vals = [v['value'] for v in meas_res.json().get('data', []) if v.get('value') is not None]
-                            avg = sum(vals)/len(vals) if vals else np.nan
-                            data_list.append({'Site_ID': site_id, '7D_Avg_Energy_kWh': avg if not np.isnan(avg) else np.nan})
-                            continue
+                            data = meas_res.json().get(inv_id, {}).get('E_DAY', [])
+                            vals = [d['value'] for d in data if d.get('value') is not None]
+                            if vals:
+                                inv_avg = sum(vals)/len(vals)
+                                site_avg_total += inv_avg # VCOM מחזיר קוט"ש, אז אין צורך לחלק ב-1000
+                                has_data = True
                     except:
                         pass
-            data_list.append({'Site_ID': site_id, '7D_Avg_Energy_kWh': np.nan})
+                    time.sleep(0.1)
+                    
+            if has_data:
+                data_list.append({'Site_ID': site_id, '7D_Avg_Energy_kWh': site_avg_total})
+            else:
+                data_list.append({'Site_ID': site_id, '7D_Avg_Energy_kWh': np.nan})
             
     return pd.DataFrame(data_list)
 
@@ -148,7 +170,6 @@ def get_yoy_baseline(df_sites_to_scan, current_date_str):
     ly_start_str = (ly_end - timedelta(days=14)).strftime('%Y-%m-%d')
     ly_end_str = ly_end.strftime('%Y-%m-%d')
     data_list = []
-    
     vcom_start = f"{ly_start_str}T00:00:00Z"
     vcom_end = f"{ly_end_str}T23:59:59Z"
     
@@ -164,25 +185,37 @@ def get_yoy_baseline(df_sites_to_scan, current_date_str):
                     vals = [v['value'] for v in res.json().get('energy', {}).get('values', []) if v.get('value') is not None]
                     avg = sum(vals)/len(vals) if vals else np.nan
                     data_list.append({'Site_ID': site_id, 'LY_Avg_Energy_kWh': avg / 1000 if not np.isnan(avg) else np.nan})
+                    continue
             except:
-                data_list.append({'Site_ID': site_id, 'LY_Avg_Energy_kWh': np.nan})
+                pass
+            data_list.append({'Site_ID': site_id, 'LY_Avg_Energy_kWh': np.nan})
                 
         elif portal == 'VCOM':
             auth, headers = get_vcom_auth(row['Account_Name'])
+            has_data = False
+            site_avg_total = 0.0
+            
             if auth:
-                inv_id = get_vcom_first_inverter(site_id, auth, headers)
-                if inv_id:
+                inverters = get_vcom_inverters(site_id, auth, headers)
+                for inv_id in inverters:
                     meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
                     try:
                         meas_res = requests.get(meas_url, auth=auth, headers=headers, params={"from": vcom_start, "to": vcom_end, "resolution": "day"}, timeout=10)
                         if meas_res.status_code == 200:
-                            vals = [v['value'] for v in meas_res.json().get('data', []) if v.get('value') is not None]
-                            avg = sum(vals)/len(vals) if vals else np.nan
-                            data_list.append({'Site_ID': site_id, 'LY_Avg_Energy_kWh': avg if not np.isnan(avg) else np.nan})
-                            continue
+                            data = meas_res.json().get(inv_id, {}).get('E_DAY', [])
+                            vals = [d['value'] for d in data if d.get('value') is not None]
+                            if vals:
+                                inv_avg = sum(vals)/len(vals)
+                                site_avg_total += inv_avg 
+                                has_data = True
                     except:
                         pass
-            data_list.append({'Site_ID': site_id, 'LY_Avg_Energy_kWh': np.nan})
+                    time.sleep(0.1)
+                    
+            if has_data:
+                data_list.append({'Site_ID': site_id, 'LY_Avg_Energy_kWh': site_avg_total})
+            else:
+                data_list.append({'Site_ID': site_id, 'LY_Avg_Energy_kWh': np.nan})
             
     return pd.DataFrame(data_list)
 
@@ -250,7 +283,6 @@ def get_inverter_diagnosis(row, target_date):
         return "Faults: " + " | ".join(faults) if faults else "Inverters balanced. Check Shading/Soiling."
     except:
         return "Diagnosis Failed"
-
 
 # --- ממשק המשתמש (UI) ---
 st.title("☀️ Solar Monitor - AI Hit List")
@@ -333,7 +365,6 @@ if run_button:
     
     df_master['Performance_vs_Cluster'] = np.where(df_master['Cluster_Median_Yield'] > 0, df_master['Specific_Yield'] / df_master['Cluster_Median_Yield'], np.nan)
     
-    # --- סינון חכם (Smart Pre-Filter) ---
     df_master['Needs_Deep_Scan'] = (
         (df_master['Performance_vs_Cluster'] < 0.97) | 
         (df_master['7D_Change_%'] < -3.0) | 
@@ -353,7 +384,6 @@ if run_button:
     for index, (i, row) in enumerate(sites_to_deep_scan.iterrows()):
         if total_sites_count > 0:
             progress_bar.progress(60 + int((index / total_sites_count) * 35))
-        # עכשיו נעביר את כל השורה לפונקציה כדי שתדע אם זה סולאראדג' או VCOM
         diagnoses_dict[row['Site_ID']] = get_inverter_diagnosis(row, target_date_str)
         
     df_master['System_Diagnosis'] = df_master['Site_ID'].map(diagnoses_dict).fillna("Skipped (Site Optimal - No Drops Detected)")
@@ -373,7 +403,6 @@ if run_button:
     status_text.empty()
     progress_bar.empty()
     
-    # --- הצגת התוצאות ---
     if selected_sites:
         anomalies = df_master.copy()
     else:
@@ -399,8 +428,7 @@ if run_button:
         display_df['7D_Change_%'] = display_df['7D_Change_%'].apply(lambda x: f"{x:.1f}%" if pd.notnull(x) else "-")
         display_df['YoY_Change_%'] = display_df['YoY_Change_%'].apply(lambda x: f"{x:.1f}%" if pd.notnull(x) else "-")
         
-        # המרת הטבלה לסוג "אובייקט" שמאפשר שילוב של מספרים וטקסט (כמו המקף)
-        display_df = display_df.astype(object) 
+        display_df = display_df.astype(object)
         display_df.fillna("-", inplace=True)
         
         display_df.rename(columns={
