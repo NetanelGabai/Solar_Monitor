@@ -10,10 +10,9 @@ from requests.auth import HTTPBasicAuth
 from concurrent.futures import ThreadPoolExecutor, as_completed 
 
 # --- הגדרות האפליקציה ---
-st.set_page_config(page_title="Solar Monitor - Daily Hit List", page_icon="☀️", layout="wide")
+st.set_page_config(page_title="Solar Monitor - AI Hit List", page_icon="☀️", layout="wide")
 
-# --- הגדרות MIN MAX (נקודת האיזון למהירות ויציבות) ---
-MAX_WORKERS = 4
+MAX_WORKERS = 5
 VCOM_MICRO_DELAY = 0.25 
 
 # --- הגדרות SolarEdge ---
@@ -34,7 +33,7 @@ VCOM_CREDENTIALS = {
     }
 }
 
-# --- מנוע טורבו והגנה מ-Rate Limits גנרי לכולם ---
+# --- מנוע רשת וטורבו ---
 global_http_session = requests.Session() 
 vcom_inverters_cache = {} 
 
@@ -71,26 +70,17 @@ def get_vcom_inverters(site_id, auth, headers):
         return inverters
     return {}
 
-def fetch_vcom_system_energy(site_id, auth, headers, start_dt, end_dt):
-    meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/abbreviations/E_DAY/measurements"
-    res = request_with_retry(meas_url, auth=auth, headers=headers, params={"from": start_dt, "to": end_dt, "resolution": "day"})
-    if res and res.status_code == 200:
-        data_block = res.json().get('data', {})
-        e_day_data = data_block.get(site_id, {}).get('E_DAY', []) 
-        if not e_day_data: 
-            e_day_data = data_block.get('E_DAY', [])
-        
-        vals = [d['value'] for d in e_day_data if d.get('value') is not None and d.get('value') > 0]
-        if vals:
-            return vals
-    return None
-
-def fetch_vcom_inverter_e_day(site_id, inv_id, auth, headers, start_dt, end_dt):
-    url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
+def fetch_vcom_data(site_id, inv_id, auth, headers, start_dt, end_dt, is_system=True):
+    """פונקציה חכמה ששולפת גם אתר וגם ממיר ומונעת כפילות קוד"""
+    url = f"{VCOM_BASE_URL}/systems/{site_id}/abbreviations/E_DAY/measurements" if is_system else f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
     res = request_with_retry(url, auth=auth, headers=headers, params={"from": start_dt, "to": end_dt, "resolution": "day"})
-    if res:
-        data = res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
-        return [d['value'] for d in data if d.get('value') is not None and d.get('value') > 0]
+    if res and res.status_code == 200:
+        data = res.json().get('data', {})
+        if is_system:
+            e_day = data.get(site_id, {}).get('E_DAY', [])
+            return e_day if e_day else data.get('E_DAY', [])
+        else:
+            return data.get(inv_id, {}).get('E_DAY', [])
     return []
 
 # --- פונקציות מנוע החוקים ---
@@ -131,7 +121,7 @@ def get_inverter_diagnosis(row, target_date):
         day_start = f"{target_date}T00:00:00+03:00"
         day_end = f"{target_date}T23:59:59+03:00"
         
-        # 1. שליפה חכמה של נתון מנורמל ונתון אבסולוטי בו זמנית
+        # דיאגנוסטיקת AC מנורמלת ע"י שליפת E_INT_N
         for inv_id, inv_name in inverters.items():
             abbr_str = "E_INT_N,E_DAY"
             meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/{abbr_str}/measurements"
@@ -140,7 +130,6 @@ def get_inverter_diagnosis(row, target_date):
             norm_val, abs_val = 0.0, 0.0
             if meas_res and meas_res.status_code == 200:
                 data = meas_res.json().get('data', {}).get(inv_id, {})
-                
                 norm_data = data.get('E_INT_N', [])
                 valid_norm = [d['value'] for d in norm_data if d.get('value') is not None and d.get('value') > 0]
                 if valid_norm: norm_val = max(valid_norm)
@@ -151,12 +140,9 @@ def get_inverter_diagnosis(row, target_date):
                 
             inv_energies[inv_name] = {'norm': norm_val, 'abs': abs_val}
             
-        # 2. החלטה האם להשוות באופן מנורמל או אבסולוטי (גיבוי)
         use_normalized = all(v['norm'] > 0 for v in inv_energies.values()) if inv_energies else False
-        
         comparison_dict = {name: (v['norm'] if use_normalized else v['abs']) for name, v in inv_energies.items()}
         max_energy = max(comparison_dict.values()) if comparison_dict else 0
-        
         unit = "kWh/kWp" if use_normalized else "kWh"
         
         for name, energy in comparison_dict.items():
@@ -165,7 +151,7 @@ def get_inverter_diagnosis(row, target_date):
             elif max_energy > 0 and energy < (max_energy * 0.75):
                 faults.append(f"{name}: Low Output ({energy:.2f} vs max {max_energy:.2f} {unit})")
 
-        # 3. בדיקת זרמי ה-DC לסטרינגים (שעות צהריים)
+        # דיאגנוסטיקת DC לסטרינגים (שעות צהריים)
         start_time = f"{target_date}T11:00:00+03:00"
         end_time = f"{target_date}T13:00:00+03:00"
         
@@ -176,7 +162,6 @@ def get_inverter_diagnosis(row, target_date):
             
             available_abbrs = abbr_res.json().get('data', [])
             dc_abbrs = [abbr for abbr in available_abbrs if abbr.startswith('I_DC')]
-            
             if not dc_abbrs: continue
             
             abbr_str = ",".join(dc_abbrs)
@@ -187,7 +172,6 @@ def get_inverter_diagnosis(row, target_date):
             
             data = meas_res.json().get('data', {}).get(inv_id, {})
             string_medians = {}
-            
             for abbr in dc_abbrs:
                 measurements = data.get(abbr, [])
                 vals = [m['value'] for m in measurements if m.get('value') is not None]
@@ -196,10 +180,9 @@ def get_inverter_diagnosis(row, target_date):
             if not string_medians: continue
             
             inv_median_current = np.median(list(string_medians.values()))
-            
             for abbr, current in string_medians.items():
                 if current < 0.5: 
-                    faults.append(f"{inv_name} ({abbr}): 0A (Suspected Open String/Blown Fuse)")
+                    faults.append(f"{inv_name} ({abbr}): 0A (Suspected Open String)")
                 elif inv_median_current > 2.0 and current < (inv_median_current * 0.6): 
                     faults.append(f"{inv_name} ({abbr}): Low Current ({current:.1f}A vs avg {inv_median_current:.1f}A)")
                     
@@ -310,163 +293,110 @@ if run_button:
     
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
     total_sites_count = len(sites_to_scan)
     
-    # --- שלב 1: תפוקה יומית ---
-    status_text.text(f"1/5: Fetching Daily Energy... (0/{total_sites_count})")
-    def fetch_daily(row):
-        site_id = str(row['Site_ID'])
-        portal = row.get('Portal', 'SolarEdge')
-        vcom_start = f"{target_date_str}T00:00:00+03:00"
-        vcom_end = f"{target_date_str}T23:59:59+03:00"
-        
-        if portal == 'SolarEdge':
-            url = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={target_date_str}&endDate={target_date_str}&api_key={API_KEY}"
-            try:
-                res = request_with_retry(url)
-                if res and res.status_code == 200:
-                    val = res.json()['energy']['values'][0]['value']
-                    return {'Site_ID': site_id, 'Energy_kWh': val / 1000 if val is not None else 0} 
-            except: pass
-            return {'Site_ID': site_id, 'Energy_kWh': np.nan}
-            
-        elif portal == 'VCOM':
-            auth, headers = get_vcom_auth(row['Account_Name'])
-            if auth:
-                system_vals = fetch_vcom_system_energy(site_id, auth, headers, vcom_start, vcom_end)
-                if system_vals:
-                    return {'Site_ID': site_id, 'Energy_kWh': max(system_vals)} 
-                
-                site_energy_total = 0.0
-                has_data = False
-                inverters = get_vcom_inverters(site_id, auth, headers)
-                for inv_id in inverters: 
-                    vals = fetch_vcom_inverter_e_day(site_id, inv_id, auth, headers, vcom_start, vcom_end)
-                    if vals:
-                        site_energy_total += max(vals) 
-                        has_data = True
-                return {'Site_ID': site_id, 'Energy_kWh': site_energy_total if has_data else np.nan}
-        return {'Site_ID': site_id, 'Energy_kWh': np.nan}
-
-    energy_data = []
-    completed = 0
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(fetch_daily, row) for _, row in sites_to_scan.iterrows()]
-        for future in as_completed(futures):
-            energy_data.append(future.result())
-            completed += 1
-            progress_bar.progress(int((completed / total_sites_count) * 20))
-            status_text.text(f"1/5: Fetching Daily Energy... ({completed}/{total_sites_count})")
-    df_daily = pd.DataFrame(energy_data)
-
-    # --- שלב 2: תפוקת 7 ימים ---
-    status_text.text(f"2/5: Fetching 7-Day Trend... (0/{total_sites_count})")
-    def fetch_7d(row):
-        site_id = str(row['Site_ID'])
-        portal = row.get('Portal', 'SolarEdge')
-        target_dt = datetime.strptime(target_date_str, '%Y-%m-%d')
-        start_date_str = (target_dt - timedelta(days=7)).strftime('%Y-%m-%d')
-        vcom_start = f"{start_date_str}T00:00:00+03:00"
-        vcom_end = f"{target_date_str}T23:59:59+03:00"
-        
-        if portal == 'SolarEdge':
-            url = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={start_date_str}&endDate={target_date_str}&api_key={API_KEY}"
-            try:
-                res = request_with_retry(url)
-                if res and res.status_code == 200:
-                    vals = [v['value'] for v in res.json().get('energy', {}).get('values', []) if v.get('value') is not None]
-                    avg = sum(vals)/len(vals) if vals else np.nan
-                    return {'Site_ID': site_id, '7D_Avg_Energy_kWh': (avg / 1000) if not np.isnan(avg) else np.nan}
-            except: pass
-            return {'Site_ID': site_id, '7D_Avg_Energy_kWh': np.nan}
-            
-        elif portal == 'VCOM':
-            auth, headers = get_vcom_auth(row['Account_Name'])
-            if auth:
-                system_vals = fetch_vcom_system_energy(site_id, auth, headers, vcom_start, vcom_end)
-                if system_vals:
-                    return {'Site_ID': site_id, '7D_Avg_Energy_kWh': sum(system_vals)/len(system_vals)}
-                
-                site_avg_total = 0.0
-                has_data = False
-                inverters = get_vcom_inverters(site_id, auth, headers)
-                for inv_id in inverters:
-                    vals = fetch_vcom_inverter_e_day(site_id, inv_id, auth, headers, vcom_start, vcom_end)
-                    if vals:
-                        site_avg_total += sum(vals)/len(vals)
-                        has_data = True
-                return {'Site_ID': site_id, '7D_Avg_Energy_kWh': site_avg_total if has_data else np.nan}
-        return {'Site_ID': site_id, '7D_Avg_Energy_kWh': np.nan}
-
-    data_7d = []
-    completed = 0
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(fetch_7d, row) for _, row in sites_to_scan.iterrows()]
-        for future in as_completed(futures):
-            data_7d.append(future.result())
-            completed += 1
-            progress_bar.progress(20 + int((completed / total_sites_count) * 20))
-            status_text.text(f"2/5: Fetching 7-Day Trend... ({completed}/{total_sites_count})")
-    df_7d = pd.DataFrame(data_7d)
-
-    # --- שלב 3: תפוקה YoY ---
-    status_text.text(f"3/5: Fetching YoY Baseline... (0/{total_sites_count})")
-    def fetch_yoy(row):
-        site_id = str(row['Site_ID'])
-        portal = row.get('Portal', 'SolarEdge')
-        curr_dt = datetime.strptime(target_date_str, '%Y-%m-%d')
-        ly_end = curr_dt.replace(year=curr_dt.year - 1)
-        ly_start_str = (ly_end - timedelta(days=14)).strftime('%Y-%m-%d')
-        ly_end_str = ly_end.strftime('%Y-%m-%d')
-        vcom_start = f"{ly_start_str}T00:00:00+03:00"
-        vcom_end = f"{ly_end_str}T23:59:59+03:00"
-        
-        if portal == 'SolarEdge':
-            url = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={ly_start_str}&endDate={ly_end_str}&api_key={API_KEY}"
-            try:
-                res = request_with_retry(url)
-                if res and res.status_code == 200:
-                    vals = [v['value'] for v in res.json().get('energy', {}).get('values', []) if v.get('value') is not None]
-                    avg = sum(vals)/len(vals) if vals else np.nan
-                    return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': (avg / 1000) if not np.isnan(avg) else np.nan}
-            except: pass
-            return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': np.nan}
-            
-        elif portal == 'VCOM':
-            auth, headers = get_vcom_auth(row['Account_Name'])
-            if auth:
-                system_vals = fetch_vcom_system_energy(site_id, auth, headers, vcom_start, vcom_end)
-                if system_vals:
-                    return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': sum(system_vals)/len(system_vals)}
-                
-                site_avg_total = 0.0
-                has_data = False
-                inverters = get_vcom_inverters(site_id, auth, headers)
-                for inv_id in inverters:
-                    vals = fetch_vcom_inverter_e_day(site_id, inv_id, auth, headers, vcom_start, vcom_end)
-                    if vals:
-                        site_avg_total += sum(vals)/len(vals)
-                        has_data = True
-                return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': site_avg_total if has_data else np.nan}
-        return {'Site_ID': site_id, 'LY_Avg_Energy_kWh': np.nan}
-
-    data_yoy = []
-    completed = 0
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(fetch_yoy, row) for _, row in sites_to_scan.iterrows()]
-        for future in as_completed(futures):
-            data_yoy.append(future.result())
-            completed += 1
-            progress_bar.progress(40 + int((completed / total_sites_count) * 20))
-            status_text.text(f"3/5: Fetching YoY Baseline... ({completed}/{total_sites_count})")
-    df_yoy = pd.DataFrame(data_yoy)
+    # === איחוד שלבים (Data Fusion): משיכת יומי, 7 ימים ו-YoY במקשה אחת ===
+    status_text.text(f"1/3: Fetching All Baselines... (0/{total_sites_count})")
     
-    # --- שלב 4: עיבוד נתונים (Geo-Clustering) ---
-    status_text.text("4/5: Running Geo-Clustering...")
-    df_master = pd.merge(df_daily, df_sites, on='Site_ID', how='inner')
-    df_master = pd.merge(df_master, df_yoy, on='Site_ID', how='left')
-    df_master = pd.merge(df_master, df_7d, on='Site_ID', how='left')
+    def fetch_site_baselines(row, target_date_str):
+        site_id = str(row['Site_ID'])
+        portal = row.get('Portal', 'SolarEdge')
+        
+        target_dt = datetime.strptime(target_date_str, '%Y-%m-%d')
+        start_7d_str = (target_dt - timedelta(days=6)).strftime('%Y-%m-%d') 
+        ly_end = target_dt.replace(year=target_dt.year - 1)
+        ly_start_str = (ly_end - timedelta(days=13)).strftime('%Y-%m-%d')
+        ly_end_str = ly_end.strftime('%Y-%m-%d')
+        
+        vcom_start_7d = f"{start_7d_str}T00:00:00+03:00"
+        vcom_end_7d = f"{target_date_str}T23:59:59+03:00"
+        vcom_start_yoy = f"{ly_start_str}T00:00:00+03:00"
+        vcom_end_yoy = f"{ly_end_str}T23:59:59+03:00"
+        
+        result = {'Site_ID': site_id, 'Energy_kWh': np.nan, '7D_Avg_Energy_kWh': np.nan, 'LY_Avg_Energy_kWh': np.nan}
+        
+        if portal == 'SolarEdge':
+            # פעם 1: שבוע אחרון (מכיל גם את היום היומי)
+            url_7d = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={start_7d_str}&endDate={target_date_str}&api_key={API_KEY}"
+            res_7d = request_with_retry(url_7d)
+            if res_7d and res_7d.status_code == 200:
+                vals = res_7d.json().get('energy', {}).get('values', [])
+                valid_vals = [v['value'] for v in vals if v.get('value') is not None]
+                if valid_vals: result['7D_Avg_Energy_kWh'] = sum(valid_vals) / len(valid_vals) / 1000.0
+                daily_obj = next((v for v in vals if target_date_str in v.get('date', '')), None)
+                if daily_obj and daily_obj.get('value') is not None: result['Energy_kWh'] = daily_obj['value'] / 1000.0
+            
+            # פעם 2: שנה שעברה
+            url_yoy = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={ly_start_str}&endDate={ly_end_str}&api_key={API_KEY}"
+            res_yoy = request_with_retry(url_yoy)
+            if res_yoy and res_yoy.status_code == 200:
+                vals = res_yoy.json().get('energy', {}).get('values', [])
+                valid_vals = [v['value'] for v in vals if v.get('value') is not None]
+                if valid_vals: result['LY_Avg_Energy_kWh'] = sum(valid_vals) / len(valid_vals) / 1000.0
+                    
+        elif portal == 'VCOM':
+            auth, headers = get_vcom_auth(row['Account_Name'])
+            if auth:
+                sys_7d_data = fetch_vcom_data(site_id, None, auth, headers, vcom_start_7d, vcom_end_7d, is_system=True)
+                sys_yoy_data = fetch_vcom_data(site_id, None, auth, headers, vcom_start_yoy, vcom_end_yoy, is_system=True)
+                
+                if sys_7d_data or sys_yoy_data:
+                    if sys_7d_data:
+                        daily_val = next((d['value'] for d in sys_7d_data if target_date_str in d.get('timestamp', '') and d.get('value') is not None), np.nan)
+                        result['Energy_kWh'] = daily_val
+                        valid_7d = [d['value'] for d in sys_7d_data if d.get('value') is not None and d.get('value') > 0]
+                        if valid_7d: result['7D_Avg_Energy_kWh'] = sum(valid_7d) / len(valid_7d)
+                    
+                    if sys_yoy_data:
+                        valid_yoy = [d['value'] for d in sys_yoy_data if d.get('value') is not None and d.get('value') > 0]
+                        if valid_yoy: result['LY_Avg_Energy_kWh'] = sum(valid_yoy) / len(valid_yoy)
+                else:
+                    # גיבוי: מעבר על ממירים פעם אחת בלבד לשני השלבים!
+                    inverters = get_vcom_inverters(site_id, auth, headers)
+                    if inverters:
+                        tot_daily, tot_7d_avg, tot_yoy_avg = 0.0, 0.0, 0.0
+                        has_daily, has_7d, has_yoy = False, False, False
+                        
+                        for inv_id in inverters:
+                            inv_7d = fetch_vcom_data(site_id, inv_id, auth, headers, vcom_start_7d, vcom_end_7d, is_system=False)
+                            if inv_7d:
+                                d_val = next((d['value'] for d in inv_7d if target_date_str in d.get('timestamp', '') and d.get('value') is not None), 0)
+                                tot_daily += d_val
+                                if d_val > 0: has_daily = True
+                                
+                                valid_7d = [d['value'] for d in inv_7d if d.get('value') is not None and d.get('value') > 0]
+                                if valid_7d:
+                                    tot_7d_avg += sum(valid_7d) / len(valid_7d)
+                                    has_7d = True
+                            
+                            inv_yoy = fetch_vcom_data(site_id, inv_id, auth, headers, vcom_start_yoy, vcom_end_yoy, is_system=False)
+                            if inv_yoy:
+                                valid_yoy = [d['value'] for d in inv_yoy if d.get('value') is not None and d.get('value') > 0]
+                                if valid_yoy:
+                                    tot_yoy_avg += sum(valid_yoy) / len(valid_yoy)
+                                    has_yoy = True
+                                    
+                        if has_daily: result['Energy_kWh'] = tot_daily
+                        if has_7d: result['7D_Avg_Energy_kWh'] = tot_7d_avg
+                        if has_yoy: result['LY_Avg_Energy_kWh'] = tot_yoy_avg
+
+        return result
+
+    baseline_data = []
+    completed = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(fetch_site_baselines, row, target_date_str) for _, row in sites_to_scan.iterrows()]
+        for future in as_completed(futures):
+            baseline_data.append(future.result())
+            completed += 1
+            progress_bar.progress(int((completed / total_sites_count) * 60)) # תופס 60% מהזמן עכשיו
+            status_text.text(f"1/3: Fetching All Baselines... ({completed}/{total_sites_count})")
+            
+    df_baselines = pd.DataFrame(baseline_data)
+    
+    # --- שלב 2: עיבוד נתונים (Geo-Clustering) ---
+    status_text.text("2/3: Running Geo-Clustering...")
+    df_master = pd.merge(df_baselines, df_sites, on='Site_ID', how='inner')
     
     df_master['Specific_Yield'] = df_master['Energy_kWh'] / df_master['Capacity_kWp']
     df_master['LY_Avg_Yield'] = df_master['LY_Avg_Energy_kWh'] / df_master['Capacity_kWp']
@@ -495,9 +425,11 @@ if run_button:
     else:
         sites_to_deep_scan = df_master[df_master['Needs_Deep_Scan']].copy()
     
-    # --- שלב 5: דיאגנוסטיקה עמוקה לממירים ---
+    progress_bar.progress(70)
+    
+    # --- שלב 3: דיאגנוסטיקה עמוקה לממירים חשודים ---
     suspect_count = len(sites_to_deep_scan)
-    status_text.text(f"5/5: Deep Scanning Inverters... (0/{suspect_count})")
+    status_text.text(f"3/3: Deep Scanning Inverters... (0/{suspect_count})")
     
     diagnoses_dict = {}
     completed_scans = 0
@@ -512,8 +444,8 @@ if run_button:
             diagnoses_dict[site_id] = diagnosis_result
             completed_scans += 1
             if suspect_count > 0:
-                progress_bar.progress(60 + int((completed_scans / suspect_count) * 40))
-                status_text.text(f"5/5: Deep Scanning Inverters... ({completed_scans}/{suspect_count})")
+                progress_bar.progress(70 + int((completed_scans / suspect_count) * 30))
+                status_text.text(f"3/3: Deep Scanning Inverters... ({completed_scans}/{suspect_count})")
         
     df_master['System_Diagnosis'] = df_master['Site_ID'].map(diagnoses_dict).fillna("Skipped (Site Optimal - No Drops Detected)")
     
