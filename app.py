@@ -158,7 +158,8 @@ def get_inverter_diagnosis(row, target_date):
                 
             inv_energies[inv_name] = {'id': inv_id, 'norm': norm_val, 'abs': abs_val}
             
-        use_normalized = all(v['norm'] > 0 for v in inv_energies.values()) if inv_energies else False
+        # התיקון הגדול: any במקום all. אם לממיר אחד לפחות יש נתון מנורמל - נשתמש בזה.
+        use_normalized = any(v['norm'] > 0 for v in inv_energies.values()) if inv_energies else False
         
         max_energy = 0
         if inv_energies:
