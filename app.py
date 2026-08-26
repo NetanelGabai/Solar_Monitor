@@ -36,6 +36,7 @@ VCOM_CREDENTIALS = {
 # --- מנוע רשת וטורבו ---
 global_http_session = requests.Session() 
 vcom_inverters_cache = {} 
+global_abbr_cache = {} # זיכרון מטמון לערוצי ממירים שיחסוך זמן
 
 def request_with_retry(url, auth=None, headers=None, params=None):
     for attempt in range(5): 
@@ -70,13 +71,8 @@ def get_vcom_inverters(site_id, auth, headers):
         return inverters
     return {}
 
-# -------------------------------------------------------------------
-# פונקציית נתיב הזהב (The Golden Path) החדשה ששילבנו!
-# -------------------------------------------------------------------
 def fetch_vcom_data(site_id, inv_id, auth, headers, start_dt, end_dt, is_system=True):
-    """פונקציה חכמה שמשלבת את נתיבי החישוב החדשים ברמת האתר ומונעת ירידה מיותרת לגיבוי ממירים"""
     if is_system:
-        # רשימת העדיפויות שלנו ברמת האתר: מונה ראשי -> ממירים מחושבים -> תפוקה גולמית ישנה
         system_endpoints = [
             f"{VCOM_BASE_URL}/systems/{site_id}/calculations/abbreviations/E_ZAEHLER/measurements",
             f"{VCOM_BASE_URL}/systems/{site_id}/calculations/abbreviations/E_MESS/measurements",
@@ -87,14 +83,12 @@ def fetch_vcom_data(site_id, inv_id, auth, headers, start_dt, end_dt, is_system=
             res = request_with_retry(url, auth=auth, headers=headers, params={"from": start_dt, "to": end_dt, "resolution": "day"})
             if res and res.status_code == 200:
                 data = res.json().get('data', {})
-                # שולף את הנתונים, לא משנה תחת איזה מפתח הם חזרו
                 site_data = data.get(site_id, {}) if site_id in data else data
                 for key, val_list in site_data.items():
                     if isinstance(val_list, list) and any(d.get('value') is not None for d in val_list):
-                        return val_list # בינגו! מצאנו נתון תקין וחסכנו סריקת ממירים
-        return [] # רק במקרה קיצון שהכל נכשל, נרד לגיבוי ממירים
+                        return val_list 
+        return [] 
     else:
-        # שליפה רגילה עבור ממיר בודד (לשלב הדיאגנוסטיקה או גיבוי עמוק)
         url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
         res = request_with_retry(url, auth=auth, headers=headers, params={"from": start_dt, "to": end_dt, "resolution": "day"})
         if res and res.status_code == 200:
@@ -139,7 +133,7 @@ def get_inverter_diagnosis(row, target_date):
         day_start = f"{target_date}T00:00:00+03:00"
         day_end = f"{target_date}T23:59:59+03:00"
         
-        # דיאגנוסטיקת AC מנורמלת ע"י שליפת E_INT_N
+        # 1. סריקת AC מהירה
         for inv_id, inv_name in inverters.items():
             abbr_str = "E_INT_N,E_DAY"
             meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/{abbr_str}/measurements"
@@ -156,54 +150,71 @@ def get_inverter_diagnosis(row, target_date):
                 valid_abs = [d['value'] for d in abs_data if d.get('value') is not None and d.get('value') > 0]
                 if valid_abs: abs_val = max(valid_abs)
                 
-            inv_energies[inv_name] = {'norm': norm_val, 'abs': abs_val}
+            inv_energies[inv_name] = {'id': inv_id, 'norm': norm_val, 'abs': abs_val}
             
         use_normalized = all(v['norm'] > 0 for v in inv_energies.values()) if inv_energies else False
-        comparison_dict = {name: (v['norm'] if use_normalized else v['abs']) for name, v in inv_energies.items()}
-        max_energy = max(comparison_dict.values()) if comparison_dict else 0
-        unit = "kWh/kWp" if use_normalized else "kWh"
         
-        for name, energy in comparison_dict.items():
+        max_energy = 0
+        if inv_energies:
+            max_energy = max([v['norm'] if use_normalized else v['abs'] for v in inv_energies.values()])
+            
+        unit = "kWh/kWp" if use_normalized else "kWh"
+        suspect_inverters_for_dc = []
+        
+        # 2. סינון טריאז' לחקירת עומק
+        for name, data in inv_energies.items():
+            energy = data['norm'] if use_normalized else data['abs']
+            inv_id = data['id']
+            
             if energy == 0:
                 faults.append(f"{name}: 0 {unit}")
-            elif max_energy > 0 and energy < (max_energy * 0.75):
-                faults.append(f"{name}: Low Output ({energy:.2f} vs max {max_energy:.2f} {unit})")
+                suspect_inverters_for_dc.append((inv_id, name))
+            elif max_energy > 0 and energy < (max_energy * 0.85): 
+                if energy < (max_energy * 0.75):
+                    faults.append(f"{name}: Low Output ({energy:.2f} vs max {max_energy:.2f} {unit})")
+                suspect_inverters_for_dc.append((inv_id, name))
 
-        # דיאגנוסטיקת DC לסטרינגים (שעות צהריים)
-        start_time = f"{target_date}T11:00:00+03:00"
-        end_time = f"{target_date}T13:00:00+03:00"
-        
-        for inv_id, inv_name in inverters.items():
-            abbr_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations"
-            abbr_res = request_with_retry(abbr_url, auth=auth, headers=headers)
-            if not abbr_res: continue
+        # 3. חקירת DC בפינצטה
+        if suspect_inverters_for_dc:
+            start_time = f"{target_date}T10:00:00+03:00" 
+            end_time = f"{target_date}T13:30:00+03:00"
             
-            available_abbrs = abbr_res.json().get('data', [])
-            dc_abbrs = [abbr for abbr in available_abbrs if abbr.startswith('I_DC')]
-            if not dc_abbrs: continue
-            
-            abbr_str = ",".join(dc_abbrs)
-            meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/{abbr_str}/measurements"
-            meas_res = request_with_retry(meas_url, auth=auth, headers=headers, params={"from": start_time, "to": end_time, "resolution": "15min"})
-            
-            if not meas_res: continue
-            
-            data = meas_res.json().get('data', {}).get(inv_id, {})
-            string_medians = {}
-            for abbr in dc_abbrs:
-                measurements = data.get(abbr, [])
-                vals = [m['value'] for m in measurements if m.get('value') is not None]
-                string_medians[abbr] = np.median(vals) if vals else 0.0
+            for inv_id, inv_name in suspect_inverters_for_dc:
+                cache_key = f"{site_id}_{inv_id}"
+                if cache_key not in global_abbr_cache:
+                    abbr_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations"
+                    abbr_res = request_with_retry(abbr_url, auth=auth, headers=headers)
+                    if abbr_res and abbr_res.status_code == 200:
+                        global_abbr_cache[cache_key] = abbr_res.json().get('data', [])
+                    else:
+                        global_abbr_cache[cache_key] = []
                 
-            if not string_medians: continue
-            
-            inv_median_current = np.median(list(string_medians.values()))
-            for abbr, current in string_medians.items():
-                if current < 0.5: 
-                    faults.append(f"{inv_name} ({abbr}): 0A (Suspected Open String)")
-                elif inv_median_current > 2.0 and current < (inv_median_current * 0.6): 
-                    faults.append(f"{inv_name} ({abbr}): Low Current ({current:.1f}A vs avg {inv_median_current:.1f}A)")
+                available_abbrs = global_abbr_cache[cache_key]
+                dc_abbrs = [abbr for abbr in available_abbrs if abbr.startswith('I_DC')]
+                if not dc_abbrs: continue
+                
+                abbr_str = ",".join(dc_abbrs)
+                meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/{abbr_str}/measurements"
+                meas_res = request_with_retry(meas_url, auth=auth, headers=headers, params={"from": start_time, "to": end_time, "resolution": "15min"})
+                
+                if not meas_res: continue
+                
+                data = meas_res.json().get('data', {}).get(inv_id, {})
+                string_medians = {}
+                for abbr in dc_abbrs:
+                    measurements = data.get(abbr, [])
+                    vals = [m['value'] for m in measurements if m.get('value') is not None]
+                    string_medians[abbr] = np.median(vals) if vals else 0.0
                     
+                if not string_medians: continue
+                
+                inv_median_current = np.median(list(string_medians.values()))
+                for abbr, current in string_medians.items():
+                    if current < 0.5: 
+                        faults.append(f"{inv_name} ({abbr}): 0A (Suspected Open String)")
+                    elif inv_median_current > 2.0 and current < (inv_median_current * 0.6): 
+                        faults.append(f"{inv_name} ({abbr}): Low Current ({current:.1f}A vs avg {inv_median_current:.1f}A)")
+                        
         return "Faults: " + " | ".join(set(faults)) if faults else "Inverters balanced. Check Shading/Soiling."
         
     elif portal == 'SolarEdge':
@@ -238,15 +249,15 @@ def get_inverter_diagnosis(row, target_date):
                 return "Site Offline: All inverters at 0 kWh"
                 
             max_specific_yield = max([d['specific_yield'] for d in inverter_data.values()])
-            faults = []
+            local_faults = []
             for name, data in inverter_data.items():
                 cap_label = f"[{data['capacity']:g}kW]" if data['capacity'] > 0 else ""
                 if data['energy'] == 0:
-                    faults.append(f"{name} {cap_label}: 0 kWh")
+                    local_faults.append(f"{name} {cap_label}: 0 kWh")
                 elif data['specific_yield'] < (max_specific_yield * 0.75): 
-                    faults.append(f"{name} {cap_label}: Low Output ({data['energy']:.1f} kWh)")
+                    local_faults.append(f"{name} {cap_label}: Low Output ({data['energy']:.1f} kWh)")
                     
-            return "Faults: " + " | ".join(faults) if faults else "Inverters balanced. Check Shading/Soiling."
+            return "Faults: " + " | ".join(local_faults) if local_faults else "Inverters balanced. Check Shading/Soiling."
         except Exception as e:
             return f"Diagnosis Failed: {str(e)[:30]}"
 
@@ -313,7 +324,6 @@ if run_button:
     status_text = st.empty()
     total_sites_count = len(sites_to_scan)
     
-    # === איחוד שלבים (Data Fusion): משיכת יומי, 7 ימים ו-YoY במקשה אחת ===
     status_text.text(f"1/3: Fetching All Baselines... (0/{total_sites_count})")
     
     def fetch_site_baselines(row, target_date_str):
@@ -353,7 +363,6 @@ if run_button:
         elif portal == 'VCOM':
             auth, headers = get_vcom_auth(row['Account_Name'])
             if auth:
-                # משתמש בפונקציית נתיב הזהב החדשה שלנו!
                 sys_7d_data = fetch_vcom_data(site_id, None, auth, headers, vcom_start_7d, vcom_end_7d, is_system=True)
                 sys_yoy_data = fetch_vcom_data(site_id, None, auth, headers, vcom_start_yoy, vcom_end_yoy, is_system=True)
                 
@@ -368,7 +377,6 @@ if run_button:
                         valid_yoy = [d['value'] for d in sys_yoy_data if d.get('value') is not None and d.get('value') > 0]
                         if valid_yoy: result['LY_Avg_Energy_kWh'] = sum(valid_yoy) / len(valid_yoy)
                 else:
-                    # גיבוי: מעבר על ממירים פעם אחת בלבד לשני השלבים!
                     inverters = get_vcom_inverters(site_id, auth, headers)
                     if inverters:
                         tot_daily, tot_7d_avg, tot_yoy_avg = 0.0, 0.0, 0.0
