@@ -33,34 +33,25 @@ VCOM_CREDENTIALS = {
     }
 }
 
-# --- מנוע רשת וטורבו (מעודכן ל-Debug ו-Fail Fast) ---
+# --- מנוע רשת וטורבו ---
 vcom_inverters_cache = {} 
 global_abbr_cache = {} 
 
 def request_with_retry(url, auth=None, headers=None, params=None):
     for attempt in range(5): 
         try:
-            # שימוש ב-requests.get נקי כדי למנוע דד-לוקס ב-Threads
             res = requests.get(url, auth=auth, headers=headers, params=params, timeout=10)
-            
             if res.status_code == 200:
                 if "meteocontrol" in url:
                     time.sleep(VCOM_MICRO_DELAY) 
                 return res
             elif res.status_code == 429: 
-                print(f"⚠️ RATE LIMIT (429) on attempt {attempt+1}! URL: {url}")
                 time.sleep((2 * (attempt + 1)) + random.uniform(0.1, 1.0)) 
                 continue
             elif res.status_code in [400, 401, 403, 404]: 
-                # FAST FAIL
                 return res
-            else:
-                print(f"❌ Server Error {res.status_code} for URL: {url}")
-                
-        except requests.exceptions.RequestException as e:
-            print(f"⚠️ Network Timeout/Error on attempt {attempt+1}: {str(e)[:50]}")
+        except requests.exceptions.RequestException:
             pass
-            
         time.sleep(1) 
     return None
 
@@ -149,6 +140,7 @@ def get_inverter_diagnosis(row, target_date):
         day_start = f"{target_date}T00:00:00+03:00"
         day_end = f"{target_date}T23:59:59+03:00"
         
+        # 1. סריקת AC
         for inv_id, inv_name in inverters.items():
             abbr_str = "E_INT_N,E_DAY"
             meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/{abbr_str}/measurements"
@@ -187,6 +179,7 @@ def get_inverter_diagnosis(row, target_date):
                     faults.append(f"{name}: Low Output ({energy:.2f} vs max {max_energy:.2f} {unit})")
                 suspect_inverters_for_dc.append((inv_id, name))
 
+        # 3. חקירת DC בפינצטה - מתעלמים לחלוטין מערוצי רפאים ריקים
         if suspect_inverters_for_dc:
             start_time = f"{target_date}T10:00:00+03:00" 
             end_time = f"{target_date}T13:30:00+03:00"
@@ -206,7 +199,6 @@ def get_inverter_diagnosis(row, target_date):
                 if not dc_abbrs: continue
                 
                 abbr_str = ",".join(dc_abbrs)
-                
                 meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/{abbr_str}/measurements"
                 meas_res = request_with_retry(meas_url, auth=auth, headers=headers, params={"from": start_time, "to": end_time, "resolution": "15min"})
                 
@@ -216,6 +208,7 @@ def get_inverter_diagnosis(row, target_date):
                     for abbr in dc_abbrs:
                         measurements = data.get(abbr, [])
                         vals = [m['value'] for m in measurements if m.get('value') is not None]
+                        # תיקון קריטי: אם אין נתונים אמיתיים (רשימה ריקה), אל תמציא 0.0 - פשוט תתעלם מהערוץ!
                         if vals:
                             string_medians[abbr] = np.median(vals)
                 
