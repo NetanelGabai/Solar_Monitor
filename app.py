@@ -70,18 +70,36 @@ def get_vcom_inverters(site_id, auth, headers):
         return inverters
     return {}
 
+# -------------------------------------------------------------------
+# פונקציית נתיב הזהב (The Golden Path) החדשה ששילבנו!
+# -------------------------------------------------------------------
 def fetch_vcom_data(site_id, inv_id, auth, headers, start_dt, end_dt, is_system=True):
-    """פונקציה חכמה ששולפת גם אתר וגם ממיר ומונעת כפילות קוד"""
-    url = f"{VCOM_BASE_URL}/systems/{site_id}/abbreviations/E_DAY/measurements" if is_system else f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
-    res = request_with_retry(url, auth=auth, headers=headers, params={"from": start_dt, "to": end_dt, "resolution": "day"})
-    if res and res.status_code == 200:
-        data = res.json().get('data', {})
-        if is_system:
-            e_day = data.get(site_id, {}).get('E_DAY', [])
-            return e_day if e_day else data.get('E_DAY', [])
-        else:
-            return data.get(inv_id, {}).get('E_DAY', [])
-    return []
+    """פונקציה חכמה שמשלבת את נתיבי החישוב החדשים ברמת האתר ומונעת ירידה מיותרת לגיבוי ממירים"""
+    if is_system:
+        # רשימת העדיפויות שלנו ברמת האתר: מונה ראשי -> ממירים מחושבים -> תפוקה גולמית ישנה
+        system_endpoints = [
+            f"{VCOM_BASE_URL}/systems/{site_id}/calculations/abbreviations/E_ZAEHLER/measurements",
+            f"{VCOM_BASE_URL}/systems/{site_id}/calculations/abbreviations/E_MESS/measurements",
+            f"{VCOM_BASE_URL}/systems/{site_id}/abbreviations/E_DAY/measurements"
+        ]
+        
+        for url in system_endpoints:
+            res = request_with_retry(url, auth=auth, headers=headers, params={"from": start_dt, "to": end_dt, "resolution": "day"})
+            if res and res.status_code == 200:
+                data = res.json().get('data', {})
+                # שולף את הנתונים, לא משנה תחת איזה מפתח הם חזרו
+                site_data = data.get(site_id, {}) if site_id in data else data
+                for key, val_list in site_data.items():
+                    if isinstance(val_list, list) and any(d.get('value') is not None for d in val_list):
+                        return val_list # בינגו! מצאנו נתון תקין וחסכנו סריקת ממירים
+        return [] # רק במקרה קיצון שהכל נכשל, נרד לגיבוי ממירים
+    else:
+        # שליפה רגילה עבור ממיר בודד (לשלב הדיאגנוסטיקה או גיבוי עמוק)
+        url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/E_DAY/measurements"
+        res = request_with_retry(url, auth=auth, headers=headers, params={"from": start_dt, "to": end_dt, "resolution": "day"})
+        if res and res.status_code == 200:
+            return res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
+        return []
 
 # --- פונקציות מנוע החוקים ---
 @st.cache_data(ttl=3600)
@@ -316,7 +334,6 @@ if run_button:
         result = {'Site_ID': site_id, 'Energy_kWh': np.nan, '7D_Avg_Energy_kWh': np.nan, 'LY_Avg_Energy_kWh': np.nan}
         
         if portal == 'SolarEdge':
-            # פעם 1: שבוע אחרון (מכיל גם את היום היומי)
             url_7d = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={start_7d_str}&endDate={target_date_str}&api_key={API_KEY}"
             res_7d = request_with_retry(url_7d)
             if res_7d and res_7d.status_code == 200:
@@ -326,7 +343,6 @@ if run_button:
                 daily_obj = next((v for v in vals if target_date_str in v.get('date', '')), None)
                 if daily_obj and daily_obj.get('value') is not None: result['Energy_kWh'] = daily_obj['value'] / 1000.0
             
-            # פעם 2: שנה שעברה
             url_yoy = f"{BASE_URL}/site/{site_id}/energy?timeUnit=DAY&startDate={ly_start_str}&endDate={ly_end_str}&api_key={API_KEY}"
             res_yoy = request_with_retry(url_yoy)
             if res_yoy and res_yoy.status_code == 200:
@@ -337,6 +353,7 @@ if run_button:
         elif portal == 'VCOM':
             auth, headers = get_vcom_auth(row['Account_Name'])
             if auth:
+                # משתמש בפונקציית נתיב הזהב החדשה שלנו!
                 sys_7d_data = fetch_vcom_data(site_id, None, auth, headers, vcom_start_7d, vcom_end_7d, is_system=True)
                 sys_yoy_data = fetch_vcom_data(site_id, None, auth, headers, vcom_start_yoy, vcom_end_yoy, is_system=True)
                 
@@ -389,7 +406,7 @@ if run_button:
         for future in as_completed(futures):
             baseline_data.append(future.result())
             completed += 1
-            progress_bar.progress(int((completed / total_sites_count) * 60)) # תופס 60% מהזמן עכשיו
+            progress_bar.progress(int((completed / total_sites_count) * 60)) 
             status_text.text(f"1/3: Fetching All Baselines... ({completed}/{total_sites_count})")
             
     df_baselines = pd.DataFrame(baseline_data)
