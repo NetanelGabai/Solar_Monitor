@@ -24,11 +24,11 @@ default_yesterday = (datetime.now() - timedelta(1)).strftime('%Y-%m-%d')
 VCOM_BASE_URL = "https://api.meteocontrol.de/v2"
 VCOM_CREDENTIALS = {
     "electraservice": {
-        "PASSWORD": "Elec74New!++",
+        "PASSWORD": "Elec74New",
         "API_KEY": "d8860d256e03c97ca24c8548c2979be6489add6c2e4a46e1c1964fb5c65bf01a"
     },
     "ELECTRA - PV": {
-        "PASSWORD": "Elec74New!++",
+        "PASSWORD": "Elec74New",
         "API_KEY": "d8860d256e03c97ca24c8548c2979be6489add6c2e4a46e1c1964fb5c65bf01a"
     }
 }
@@ -167,17 +167,18 @@ def get_inverter_diagnosis(row, target_date):
         unit = "kWh/kWp" if use_normalized else "kWh"
         suspect_inverters_for_dc = []
         
-        # 2. סינון טריאז' ויצירת התראות AC
+        # 2. סינון טריאז' ויצירת התראות AC - ללא סטרינגים לממירים מתים
         for name, data in inv_energies.items():
             energy = data['norm'] if use_normalized else data['abs']
             inv_id = data['id']
             
             if energy == 0:
                 faults.append(f"{name}: 0 {unit}")
-                suspect_inverters_for_dc.append((inv_id, name))
+                # התיקון: אנחנו לא דוחפים ממיר שמת לגמרי לחקירת הסטרינגים (DC)
             elif max_energy > 0 and energy < (max_energy * 0.95):
                 if energy < (max_energy * 0.75):
                     faults.append(f"{name}: Low Output ({energy:.2f} vs max {max_energy:.2f} {unit})")
+                # רק ממיר עם ייצור לקוי נכנס לחקירת סטרינגים
                 suspect_inverters_for_dc.append((inv_id, name))
 
         # 3. חקירת DC בפינצטה עם מנגנון גיבוי (Fallback) יומי
@@ -223,14 +224,13 @@ def get_inverter_diagnosis(row, target_date):
                             measurements = data_daily.get(abbr, [])
                             vals = [m['value'] for m in measurements if m.get('value') is not None]
                             if vals:
-                                string_medians[abbr] = vals[0] # לוקח את סכום ה-Ah היומי
+                                string_medians[abbr] = vals[0]
                                 
                 if not string_medians: continue
                 
                 inv_median_current = np.median(list(string_medians.values()))
                 for abbr, current in string_medians.items():
                     if current < 0.5: 
-                        # ההתראה של הסטרינג נדחפת לרשימת התקלות בנוסף לתקלת הממיר
                         faults.append(f"{inv_name} ({abbr}): 0A (Suspected Open String)")
                     elif inv_median_current > 2.0 and current < (inv_median_current * 0.75): 
                         faults.append(f"{inv_name} ({abbr}): Low DC ({current:.1f} vs avg {inv_median_current:.1f})")
