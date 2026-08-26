@@ -70,7 +70,6 @@ def get_vcom_inverters(site_id, auth, headers):
         inverters = {}
         for inv in res.json().get('data', []):
             name = inv.get('name', str(inv['id']))
-            # סינון הרשימה השחורה
             if not any(kw in name.upper() for kw in ignore_keywords):
                 inverters[str(inv['id'])] = name
                 
@@ -140,6 +139,7 @@ def get_inverter_diagnosis(row, target_date):
         day_start = f"{target_date}T00:00:00+03:00"
         day_end = f"{target_date}T23:59:59+03:00"
         
+        # 1. סריקת AC מהירה
         for inv_id, inv_name in inverters.items():
             abbr_str = "E_INT_N,E_DAY"
             meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/{abbr_str}/measurements"
@@ -167,6 +167,7 @@ def get_inverter_diagnosis(row, target_date):
         unit = "kWh/kWp" if use_normalized else "kWh"
         suspect_inverters_for_dc = []
         
+        # 2. סינון טריאז' רגיש (5% חריגה פותחת חקירת DC)
         for name, data in inv_energies.items():
             energy = data['norm'] if use_normalized else data['abs']
             inv_id = data['id']
@@ -174,11 +175,12 @@ def get_inverter_diagnosis(row, target_date):
             if energy == 0:
                 faults.append(f"{name}: 0 {unit}")
                 suspect_inverters_for_dc.append((inv_id, name))
-            elif max_energy > 0 and energy < (max_energy * 0.85): 
+            elif max_energy > 0 and energy < (max_energy * 0.95): # סף רגישות מעודכן: 5%
                 if energy < (max_energy * 0.75):
                     faults.append(f"{name}: Low Output ({energy:.2f} vs max {max_energy:.2f} {unit})")
                 suspect_inverters_for_dc.append((inv_id, name))
 
+        # 3. חקירת DC בפינצטה
         if suspect_inverters_for_dc:
             start_time = f"{target_date}T10:00:00+03:00" 
             end_time = f"{target_date}T13:30:00+03:00"
@@ -216,7 +218,7 @@ def get_inverter_diagnosis(row, target_date):
                 for abbr, current in string_medians.items():
                     if current < 0.5: 
                         faults.append(f"{inv_name} ({abbr}): 0A (Suspected Open String)")
-                    elif inv_median_current > 2.0 and current < (inv_median_current * 0.6): 
+                    elif inv_median_current > 2.0 and current < (inv_median_current * 0.75): # סף מעודכן: 25% ירידה מהחציון
                         faults.append(f"{inv_name} ({abbr}): Low Current ({current:.1f}A vs avg {inv_median_current:.1f}A)")
                         
         return "Faults: " + " | ".join(set(faults)) if faults else "Inverters balanced. Check Shading/Soiling."
@@ -233,7 +235,6 @@ def get_inverter_diagnosis(row, target_date):
             inverters = []
             for inv in raw_inverters:
                 name = inv.get('name', inv.get('serialNumber', ''))
-                # סינון הרשימה השחורה גם בסולאראדג'
                 if not any(kw in name.upper() for kw in ignore_keywords):
                     inverters.append(inv)
                     
