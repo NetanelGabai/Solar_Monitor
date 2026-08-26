@@ -139,7 +139,7 @@ def get_inverter_diagnosis(row, target_date):
         day_start = f"{target_date}T00:00:00+03:00"
         day_end = f"{target_date}T23:59:59+03:00"
         
-        # 1. סריקת AC מהירה
+        # 1. סריקת AC
         for inv_id, inv_name in inverters.items():
             abbr_str = "E_INT_N,E_DAY"
             meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/{abbr_str}/measurements"
@@ -158,7 +158,6 @@ def get_inverter_diagnosis(row, target_date):
                 
             inv_energies[inv_name] = {'id': inv_id, 'norm': norm_val, 'abs': abs_val}
             
-        # התיקון הגדול: any במקום all. אם לממיר אחד לפחות יש נתון מנורמל - נשתמש בזה.
         use_normalized = any(v['norm'] > 0 for v in inv_energies.values()) if inv_energies else False
         
         max_energy = 0
@@ -168,7 +167,7 @@ def get_inverter_diagnosis(row, target_date):
         unit = "kWh/kWp" if use_normalized else "kWh"
         suspect_inverters_for_dc = []
         
-        # 2. סינון טריאז' רגיש (5% חריגה פותחת חקירת DC)
+        # 2. סינון טריאז' ויצירת התראות AC
         for name, data in inv_energies.items():
             energy = data['norm'] if use_normalized else data['abs']
             inv_id = data['id']
@@ -176,12 +175,12 @@ def get_inverter_diagnosis(row, target_date):
             if energy == 0:
                 faults.append(f"{name}: 0 {unit}")
                 suspect_inverters_for_dc.append((inv_id, name))
-            elif max_energy > 0 and energy < (max_energy * 0.95): # סף רגישות מעודכן: 5%
+            elif max_energy > 0 and energy < (max_energy * 0.95):
                 if energy < (max_energy * 0.75):
                     faults.append(f"{name}: Low Output ({energy:.2f} vs max {max_energy:.2f} {unit})")
                 suspect_inverters_for_dc.append((inv_id, name))
 
-        # 3. חקירת DC בפינצטה
+        # 3. חקירת DC בפינצטה עם מנגנון גיבוי (Fallback) יומי
         if suspect_inverters_for_dc:
             start_time = f"{target_date}T10:00:00+03:00" 
             end_time = f"{target_date}T13:30:00+03:00"
@@ -201,26 +200,40 @@ def get_inverter_diagnosis(row, target_date):
                 if not dc_abbrs: continue
                 
                 abbr_str = ",".join(dc_abbrs)
+                
+                # מנסים קודם רזולוציה של 15 דקות
                 meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/{abbr_str}/measurements"
                 meas_res = request_with_retry(meas_url, auth=auth, headers=headers, params={"from": start_time, "to": end_time, "resolution": "15min"})
                 
-                if not meas_res: continue
-                
-                data = meas_res.json().get('data', {}).get(inv_id, {})
                 string_medians = {}
-                for abbr in dc_abbrs:
-                    measurements = data.get(abbr, [])
-                    vals = [m['value'] for m in measurements if m.get('value') is not None]
-                    string_medians[abbr] = np.median(vals) if vals else 0.0
-                    
+                if meas_res and meas_res.status_code == 200:
+                    data = meas_res.json().get('data', {}).get(inv_id, {})
+                    for abbr in dc_abbrs:
+                        measurements = data.get(abbr, [])
+                        vals = [m['value'] for m in measurements if m.get('value') is not None]
+                        if vals:
+                            string_medians[abbr] = np.median(vals)
+                
+                # גיבוי (Fallback): אם ה-15 דקות ריק (בגלל נתוני Ah יומיים), נבקש רזולוציה יומית
+                if not string_medians:
+                    meas_res_daily = request_with_retry(meas_url, auth=auth, headers=headers, params={"from": day_start, "to": day_end, "resolution": "day"})
+                    if meas_res_daily and meas_res_daily.status_code == 200:
+                        data_daily = meas_res_daily.json().get('data', {}).get(inv_id, {})
+                        for abbr in dc_abbrs:
+                            measurements = data_daily.get(abbr, [])
+                            vals = [m['value'] for m in measurements if m.get('value') is not None]
+                            if vals:
+                                string_medians[abbr] = vals[0] # לוקח את סכום ה-Ah היומי
+                                
                 if not string_medians: continue
                 
                 inv_median_current = np.median(list(string_medians.values()))
                 for abbr, current in string_medians.items():
                     if current < 0.5: 
+                        # ההתראה של הסטרינג נדחפת לרשימת התקלות בנוסף לתקלת הממיר
                         faults.append(f"{inv_name} ({abbr}): 0A (Suspected Open String)")
-                    elif inv_median_current > 2.0 and current < (inv_median_current * 0.75): # סף מעודכן: 25% ירידה מהחציון
-                        faults.append(f"{inv_name} ({abbr}): Low Current ({current:.1f}A vs avg {inv_median_current:.1f}A)")
+                    elif inv_median_current > 2.0 and current < (inv_median_current * 0.75): 
+                        faults.append(f"{inv_name} ({abbr}): Low DC ({current:.1f} vs avg {inv_median_current:.1f})")
                         
         return "Faults: " + " | ".join(set(faults)) if faults else "Inverters balanced. Check Shading/Soiling."
         
@@ -493,7 +506,7 @@ if run_button:
         (df_master['Performance_vs_Cluster'] < 0.80) | 
         (df_master['7D_Change_%'] < -10.0) | 
         (df_master['YoY_Change_%'] < -20.0) |
-        (df_master['System_Diagnosis'].str.contains('0 kWh|0A|Low Current|Low Output|Offline|Faults', na=False, regex=True)), 
+        (df_master['System_Diagnosis'].str.contains('0 kWh|0A|Low Current|Low Output|Offline|Low DC|Faults', na=False, regex=True)), 
         '🔴 Fault Suspected', 
         '🟢 OK'
     )
