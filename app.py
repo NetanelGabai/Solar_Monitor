@@ -36,7 +36,7 @@ VCOM_CREDENTIALS = {
 # --- מנוע רשת וטורבו ---
 global_http_session = requests.Session() 
 vcom_inverters_cache = {} 
-global_abbr_cache = {} # זיכרון מטמון לערוצי ממירים שיחסוך זמן
+global_abbr_cache = {} 
 
 def request_with_retry(url, auth=None, headers=None, params=None):
     for attempt in range(5): 
@@ -66,7 +66,14 @@ def get_vcom_inverters(site_id, auth, headers):
         
     res = request_with_retry(f"{VCOM_BASE_URL}/systems/{site_id}/inverters", auth=auth, headers=headers)
     if res and res.status_code == 200:
-        inverters = {str(inv['id']): inv.get('name', str(inv['id'])) for inv in res.json().get('data', [])}
+        ignore_keywords = ['INACTIVE', 'DISCONNECTED', 'OLD', 'N/A']
+        inverters = {}
+        for inv in res.json().get('data', []):
+            name = inv.get('name', str(inv['id']))
+            # סינון הרשימה השחורה
+            if not any(kw in name.upper() for kw in ignore_keywords):
+                inverters[str(inv['id'])] = name
+                
         vcom_inverters_cache[site_id] = inverters
         return inverters
     return {}
@@ -126,14 +133,13 @@ def get_inverter_diagnosis(row, target_date):
         if not auth: return "VCOM Auth Error"
         
         inverters = get_vcom_inverters(site_id, auth, headers)
-        if not inverters: return "No inverters found"
+        if not inverters: return "No active inverters found"
         
         faults = []
         inv_energies = {}
         day_start = f"{target_date}T00:00:00+03:00"
         day_end = f"{target_date}T23:59:59+03:00"
         
-        # 1. סריקת AC מהירה
         for inv_id, inv_name in inverters.items():
             abbr_str = "E_INT_N,E_DAY"
             meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/{abbr_str}/measurements"
@@ -161,7 +167,6 @@ def get_inverter_diagnosis(row, target_date):
         unit = "kWh/kWp" if use_normalized else "kWh"
         suspect_inverters_for_dc = []
         
-        # 2. סינון טריאז' לחקירת עומק
         for name, data in inv_energies.items():
             energy = data['norm'] if use_normalized else data['abs']
             inv_id = data['id']
@@ -174,7 +179,6 @@ def get_inverter_diagnosis(row, target_date):
                     faults.append(f"{name}: Low Output ({energy:.2f} vs max {max_energy:.2f} {unit})")
                 suspect_inverters_for_dc.append((inv_id, name))
 
-        # 3. חקירת DC בפינצטה
         if suspect_inverters_for_dc:
             start_time = f"{target_date}T10:00:00+03:00" 
             end_time = f"{target_date}T13:30:00+03:00"
@@ -223,8 +227,17 @@ def get_inverter_diagnosis(row, target_date):
             res = request_with_retry(equip_url)
             if not res or res.status_code != 200: return "API Error"
             
-            inverters = [eq for eq in res.json().get('reporters', {}).get('list', []) if 'inverter' in eq.get('name', '').lower() or eq.get('type', '') == 'Inverter']
-            if not inverters: return "No inverters found"
+            ignore_keywords = ['INACTIVE', 'DISCONNECTED', 'OLD', 'N/A']
+            raw_inverters = [eq for eq in res.json().get('reporters', {}).get('list', []) if 'inverter' in eq.get('name', '').lower() or eq.get('type', '') == 'Inverter']
+            
+            inverters = []
+            for inv in raw_inverters:
+                name = inv.get('name', inv.get('serialNumber', ''))
+                # סינון הרשימה השחורה גם בסולאראדג'
+                if not any(kw in name.upper() for kw in ignore_keywords):
+                    inverters.append(inv)
+                    
+            if not inverters: return "No active inverters found"
                 
             inverter_data = {}
             for inv in inverters:
