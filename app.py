@@ -51,7 +51,6 @@ def request_with_retry(url, auth=None, headers=None, params=None):
                 time.sleep((2 * (attempt + 1)) + random.uniform(0.1, 1.0)) 
                 continue
             elif res.status_code in [400, 401, 403, 404]: 
-                # FAST FAIL: ערוץ לא קיים או בקשה שגויה
                 return res
             else:
                 print(f"❌ Server Error {res.status_code} for URL: {url}")
@@ -108,6 +107,28 @@ def fetch_vcom_data(site_id, inv_id, auth, headers, start_dt, end_dt, is_system=
         if res and res.status_code == 200:
             return res.json().get('data', {}).get(inv_id, {}).get('E_DAY', [])
         return []
+
+# --- בדיקת היסטוריה (Ghost String Filter) ---
+def is_real_string(site_id, inv_id, abbr, auth, headers, target_date_str):
+    target_dt = datetime.strptime(target_date_str, '%Y-%m-%d')
+    offsets = [7, 30, 365] # שבוע, חודש, שנה אחורה
+    
+    for offset in offsets:
+        check_dt = target_dt - timedelta(days=offset)
+        check_date_str = check_dt.strftime('%Y-%m-%d')
+        s_time = f"{check_date_str}T10:00:00+03:00"
+        e_time = f"{check_date_str}T13:30:00+03:00"
+        
+        url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/{abbr}/measurements"
+        res = request_with_retry(url, auth=auth, headers=headers, params={"from": s_time, "to": e_time, "resolution": "interval"})
+        
+        if res and res.status_code == 200:
+            data = res.json().get('data', {}).get(inv_id, {}).get(abbr, [])
+            vals = [m['value'] for m in data if m.get('value') is not None]
+            if vals and np.median(vals) > 0.5:
+                return True # מצאנו דופק בעבר! זה סטרינג אמיתי
+                
+    return False # לא חזר זרם באף דגימה היסטורית -> זה ערוץ רפאים
 
 # --- פונקציות מנוע החוקים ---
 @st.cache_data(ttl=3600)
@@ -200,15 +221,13 @@ def get_inverter_diagnosis(row, target_date):
                         global_abbr_cache[cache_key] = []
                 
                 available_abbrs = global_abbr_cache[cache_key]
-                # התיקון: התעלמות מהזרם הכולל I_DC של הממיר
                 dc_abbrs = [abbr for abbr in available_abbrs if abbr.startswith('I_DC') and abbr != 'I_DC']
                 if not dc_abbrs: continue
                 
                 abbr_str = ",".join(dc_abbrs)
                 meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/{abbr_str}/measurements"
                 
-                string_medians = {}
-                # התיקון: חלון זמן של רבע שעה מוגדר כ-interval ב-VCOM
+                raw_string_medians = {}
                 meas_res = request_with_retry(meas_url, auth=auth, headers=headers, params={"from": start_time, "to": end_time, "resolution": "interval"})
                 if meas_res and meas_res.status_code == 200:
                     data = meas_res.json().get('data', {}).get(inv_id, {})
@@ -216,9 +235,9 @@ def get_inverter_diagnosis(row, target_date):
                         measurements = data.get(abbr, [])
                         vals = [m['value'] for m in measurements if m.get('value') is not None]
                         if vals:
-                            string_medians[abbr] = np.median(vals)
+                            raw_string_medians[abbr] = np.median(vals)
                 
-                if not string_medians:
+                if not raw_string_medians:
                     meas_res_daily = request_with_retry(meas_url, auth=auth, headers=headers, params={"from": day_start, "to": day_end, "resolution": "day"})
                     if meas_res_daily and meas_res_daily.status_code == 200:
                         data_daily = meas_res_daily.json().get('data', {}).get(inv_id, {})
@@ -226,12 +245,25 @@ def get_inverter_diagnosis(row, target_date):
                             measurements = data_daily.get(abbr, [])
                             vals = [m['value'] for m in measurements if m.get('value') is not None]
                             if vals:
-                                string_medians[abbr] = vals[0]
+                                raw_string_medians[abbr] = vals[0]
                                 
-                if not string_medians: continue
+                if not raw_string_medians: continue
                 
-                inv_median_current = np.median(list(string_medians.values()))
-                for abbr, current in string_medians.items():
+                # התיקון הגדול: סינון ערוצי רפאים לפני חישוב החציון של הממיר
+                valid_string_medians = {}
+                for abbr, current in raw_string_medians.items():
+                    if current < 0.5:
+                        if is_real_string(site_id, inv_id, abbr, auth, headers, target_date):
+                            valid_string_medians[abbr] = current
+                        else:
+                            print(f"👻 סונן ערוץ רפאים {abbr} בממיר {inv_name}")
+                    else:
+                        valid_string_medians[abbr] = current
+                
+                if not valid_string_medians: continue
+                        
+                inv_median_current = np.median(list(valid_string_medians.values()))
+                for abbr, current in valid_string_medians.items():
                     if current < 0.5: 
                         faults.append(f"{inv_name} ({abbr}): 0A (Suspected Open String)")
                     elif inv_median_current > 2.0 and current < (inv_median_current * 0.75): 
