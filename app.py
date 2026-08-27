@@ -51,7 +51,7 @@ def request_with_retry(url, auth=None, headers=None, params=None):
                 time.sleep((2 * (attempt + 1)) + random.uniform(0.1, 1.0)) 
                 continue
             elif res.status_code in [400, 401, 403, 404]: 
-                # FAST FAIL: ערוץ לא קיים, מדלגים בלי להמתין
+                # FAST FAIL: ערוץ לא קיים או בקשה שגויה
                 return res
             else:
                 print(f"❌ Server Error {res.status_code} for URL: {url}")
@@ -200,20 +200,22 @@ def get_inverter_diagnosis(row, target_date):
                         global_abbr_cache[cache_key] = []
                 
                 available_abbrs = global_abbr_cache[cache_key]
-                dc_abbrs = [abbr for abbr in available_abbrs if abbr.startswith('I_DC')]
+                # התיקון: התעלמות מהזרם הכולל I_DC של הממיר
+                dc_abbrs = [abbr for abbr in available_abbrs if abbr.startswith('I_DC') and abbr != 'I_DC']
                 if not dc_abbrs: continue
                 
                 abbr_str = ",".join(dc_abbrs)
                 meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/{abbr_str}/measurements"
                 
                 string_medians = {}
-                meas_res = request_with_retry(meas_url, auth=auth, headers=headers, params={"from": start_time, "to": end_time, "resolution": "15min"})
+                # התיקון: חלון זמן של רבע שעה מוגדר כ-interval ב-VCOM
+                meas_res = request_with_retry(meas_url, auth=auth, headers=headers, params={"from": start_time, "to": end_time, "resolution": "interval"})
                 if meas_res and meas_res.status_code == 200:
                     data = meas_res.json().get('data', {}).get(inv_id, {})
                     for abbr in dc_abbrs:
                         measurements = data.get(abbr, [])
                         vals = [m['value'] for m in measurements if m.get('value') is not None]
-                        if vals: # רק אם באמת חזרו נתונים שאינם Null!
+                        if vals:
                             string_medians[abbr] = np.median(vals)
                 
                 if not string_medians:
@@ -223,7 +225,7 @@ def get_inverter_diagnosis(row, target_date):
                         for abbr in dc_abbrs:
                             measurements = data_daily.get(abbr, [])
                             vals = [m['value'] for m in measurements if m.get('value') is not None]
-                            if vals: # רק אם באמת חזרו נתונים!
+                            if vals:
                                 string_medians[abbr] = vals[0]
                                 
                 if not string_medians: continue
