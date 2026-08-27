@@ -33,14 +33,13 @@ VCOM_CREDENTIALS = {
     }
 }
 
-# --- מנוע רשת וטורבו (מעודכן ל-Debug ו-Fail Fast) ---
+# --- מנוע רשת וטורבו ---
 vcom_inverters_cache = {} 
 global_abbr_cache = {} 
 
 def request_with_retry(url, auth=None, headers=None, params=None):
     for attempt in range(5): 
         try:
-            # שימוש ב-requests.get נקי כדי למנוע דד-לוקס ב-Threads
             res = requests.get(url, auth=auth, headers=headers, params=params, timeout=10)
             
             if res.status_code == 200:
@@ -52,13 +51,12 @@ def request_with_retry(url, auth=None, headers=None, params=None):
                 time.sleep((2 * (attempt + 1)) + random.uniform(0.1, 1.0)) 
                 continue
             elif res.status_code in [400, 401, 403, 404]: 
-                # FAST FAIL
+                # FAST FAIL: ערוץ לא קיים, מדלגים בלי להמתין
                 return res
             else:
                 print(f"❌ Server Error {res.status_code} for URL: {url}")
                 
         except requests.exceptions.RequestException as e:
-            print(f"⚠️ Network Timeout/Error on attempt {attempt+1}: {str(e)[:50]}")
             pass
             
         time.sleep(1) 
@@ -206,17 +204,16 @@ def get_inverter_diagnosis(row, target_date):
                 if not dc_abbrs: continue
                 
                 abbr_str = ",".join(dc_abbrs)
-                
                 meas_url = f"{VCOM_BASE_URL}/systems/{site_id}/inverters/{inv_id}/abbreviations/{abbr_str}/measurements"
-                meas_res = request_with_retry(meas_url, auth=auth, headers=headers, params={"from": start_time, "to": end_time, "resolution": "15min"})
                 
                 string_medians = {}
+                meas_res = request_with_retry(meas_url, auth=auth, headers=headers, params={"from": start_time, "to": end_time, "resolution": "15min"})
                 if meas_res and meas_res.status_code == 200:
                     data = meas_res.json().get('data', {}).get(inv_id, {})
                     for abbr in dc_abbrs:
                         measurements = data.get(abbr, [])
                         vals = [m['value'] for m in measurements if m.get('value') is not None]
-                        if vals:
+                        if vals: # רק אם באמת חזרו נתונים שאינם Null!
                             string_medians[abbr] = np.median(vals)
                 
                 if not string_medians:
@@ -226,7 +223,7 @@ def get_inverter_diagnosis(row, target_date):
                         for abbr in dc_abbrs:
                             measurements = data_daily.get(abbr, [])
                             vals = [m['value'] for m in measurements if m.get('value') is not None]
-                            if vals:
+                            if vals: # רק אם באמת חזרו נתונים!
                                 string_medians[abbr] = vals[0]
                                 
                 if not string_medians: continue
