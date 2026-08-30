@@ -10,7 +10,7 @@ from requests.auth import HTTPBasicAuth
 from concurrent.futures import ThreadPoolExecutor, as_completed 
 
 # --- הגדרות האפליקציה ---
-st.set_page_config(page_title="men-AI-ter", page_icon="🌞", layout="wide")
+st.set_page_config(page_title="Men-AI-ter", page_icon="🌞", layout="wide")
 
 MAX_WORKERS = 5
 VCOM_MICRO_DELAY = 0.25 
@@ -324,7 +324,7 @@ def get_inverter_diagnosis(row, target_date):
             return f"Diagnosis Failed: {str(e)[:30]}"
 
 # --- ממשק המשתמש (UI) ---
-st.title("🌞 men-AI-ter - המנייטר")
+st.title("🌞 Men-AI-ter - המנייטר")
 st.markdown("Automated anomaly detection using Geo-Clustering, YoY trends, and normalized Inverter-level diagnosis.")
 
 df_sites = load_metadata()
