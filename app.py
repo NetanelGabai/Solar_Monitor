@@ -135,6 +135,7 @@ def is_real_string(site_id, inv_id, abbr, auth, headers, target_date_str):
 def load_metadata():
     try:
         df = pd.read_csv('sites_metadata.csv', encoding='utf-8-sig') 
+        df = df[df['Is_Active'] == 1]
         df = df[~df['Name'].str.contains(r'DELETED|DISABLED|\*|^Z\s*-', na=False, case=False)]
         df = df.dropna(subset=['Latitude', 'Longitude'])
         df['Capacity_kWp'] = pd.to_numeric(df['Capacity_kWp'], errors='coerce') 
