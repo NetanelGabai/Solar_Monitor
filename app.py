@@ -12,8 +12,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # --- הגדרות האפליקציה ---
 st.set_page_config(page_title="Men-AI-ter", page_icon="🌞", layout="wide")
 
-MAX_WORKERS = 5
-VCOM_MICRO_DELAY = 0.25 
+MAX_WORKERS = 10
+VCOM_MICRO_DELAY = 0.1
 
 # --- הגדרות SolarEdge ---
 API_KEY = "K0X7PD9WAJ11B33DM7BUWNY6VCJ9YVFS"
