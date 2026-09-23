@@ -343,23 +343,24 @@ with st.sidebar:
         selected_sites = st.multiselect("Select specific sites to scan (optional):", options=site_options)
         
         st.divider()
-        scan_mode = None
+        scan_modes = []
         scan_limit = 0
         
         if not selected_sites:
             st.subheader("🗂️ Bulk Scan Options")
             total_sites = len(df_sites)
-            scan_mode = st.radio(
-                "Select portfolio to scan:",
+            scan_modes = st.multiselect(
+                "Select portfolios to scan:",
                 options=[
                     "🧪 Test Mode (Custom Sample)",
                     "☀️ All SolarEdge Sites",
                     "⚡ VCOM: electraservice",
                     "⚡ VCOM: ELECTRA - PV",
                     f"⚠️ Scan ALL ({total_sites} sites - High Timeout Risk)"
-                ]
+                ],
+                default=["⚡ VCOM: electraservice"]
             )
-            if scan_mode == "🧪 Test Mode (Custom Sample)":
+            if "🧪 Test Mode (Custom Sample)" in scan_modes:
                 scan_limit = st.number_input(f"Number of Sites to Scan (Max: {total_sites})", min_value=1, max_value=total_sites if total_sites > 0 else 1, value=min(20, total_sites), step=10)
     
     run_button = st.button("🚀 Run Anomaly Detection", use_container_width=True, type="primary")
@@ -370,18 +371,23 @@ if run_button:
     if selected_sites:
         sites_to_scan = df_sites[df_sites['Name'].isin(selected_sites)].copy()
     else:
-        if scan_mode == "🧪 Test Mode (Custom Sample)":
-            sites_to_scan = df_sites.head(int(scan_limit)).copy()
-        elif scan_mode == "☀️ All SolarEdge Sites":
-            sites_to_scan = df_sites[df_sites['Portal'] == 'SolarEdge'].copy()
-        elif scan_mode == "⚡ VCOM: electraservice":
-            sites_to_scan = df_sites[(df_sites['Portal'] == 'VCOM') & (df_sites['Account_Name'] == 'electraservice')].copy()
-        elif scan_mode == "⚡ VCOM: ELECTRA - PV":
-            sites_to_scan = df_sites[(df_sites['Portal'] == 'VCOM') & (df_sites['Account_Name'] == 'ELECTRA - PV')].copy()
-        elif scan_mode and scan_mode.startswith("⚠️ Scan ALL"):
-            sites_to_scan = df_sites.copy()
+        frames = []
+        if "🧪 Test Mode (Custom Sample)" in scan_modes:
+            frames.append(df_sites.head(int(scan_limit)))
+        if "☀️ All SolarEdge Sites" in scan_modes:
+            frames.append(df_sites[df_sites['Portal'] == 'SolarEdge'])
+        if "⚡ VCOM: electraservice" in scan_modes:
+            frames.append(df_sites[(df_sites['Portal'] == 'VCOM') & (df_sites['Account_Name'] == 'electraservice')])
+        if "⚡ VCOM: ELECTRA - PV" in scan_modes:
+            frames.append(df_sites[(df_sites['Portal'] == 'VCOM') & (df_sites['Account_Name'] == 'ELECTRA - PV')])
+        if any(mode.startswith("⚠️ Scan ALL") for mode in scan_modes):
+            frames.append(df_sites)
+            
+        if frames:
+            sites_to_scan = pd.concat(frames).drop_duplicates(subset=['Site_ID']).copy()
         else:
-            sites_to_scan = df_sites.head(20).copy()
+            st.warning("Please select at least one portfolio from the scan options.")
+            st.stop()
     
     progress_bar = st.progress(0)
     status_text = st.empty()
