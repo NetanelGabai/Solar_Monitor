@@ -131,7 +131,7 @@ def is_real_string(site_id, inv_id, abbr, auth, headers, target_date_str):
     return False # לא חזר זרם באף דגימה היסטורית -> זה ערוץ רפאים
 
 # --- פונקציות מנוע החוקים ---
-@st.cache_data(ttl=3599)
+@st.cache_data(ttl=3600)
 def load_metadata():
     try:
         df = pd.read_csv('sites_metadata.csv', encoding='utf-8-sig') 
