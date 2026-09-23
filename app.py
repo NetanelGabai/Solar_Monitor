@@ -349,17 +349,23 @@ with st.sidebar:
         if not selected_sites:
             st.subheader("🗂️ Bulk Scan Options")
             total_sites = len(df_sites)
-            scan_modes = st.multiselect(
-                "Select portfolios to scan:",
-                options=[
-                    "🧪 Test Mode (Custom Sample)",
-                    "☀️ All SolarEdge Sites",
-                    "⚡ VCOM: electraservice",
-                    "⚡ VCOM: ELECTRA - PV",
-                    f"⚠️ Scan ALL ({total_sites} sites - High Timeout Risk)"
-                ],
-                default=["⚡ VCOM: electraservice"]
-            )
+            
+            st.markdown("**Select portfolios to scan:**")
+            
+            # יצירת תיבות סימון עצמאיות למראה של רשימה פתוחה
+            chk_test = st.checkbox("🧪 Test Mode (Custom Sample)", value=False)
+            chk_se = st.checkbox("☀️ All SolarEdge Sites", value=False)
+            chk_vcom_elec = st.checkbox("⚡ VCOM: electraservice", value=True)
+            chk_vcom_pv = st.checkbox("⚡ VCOM: ELECTRA - PV", value=False)
+            chk_all = st.checkbox(f"⚠️ Scan ALL ({total_sites} sites - High Timeout Risk)", value=False)
+            
+            # איסוף כל התיבות שסומנו לרשימה אחת
+            if chk_test: scan_modes.append("🧪 Test Mode (Custom Sample)")
+            if chk_se: scan_modes.append("☀️ All SolarEdge Sites")
+            if chk_vcom_elec: scan_modes.append("⚡ VCOM: electraservice")
+            if chk_vcom_pv: scan_modes.append("⚡ VCOM: ELECTRA - PV")
+            if chk_all: scan_modes.append(f"⚠️ Scan ALL ({total_sites} sites - High Timeout Risk)")
+            
             if "🧪 Test Mode (Custom Sample)" in scan_modes:
                 scan_limit = st.number_input(f"Number of Sites to Scan (Max: {total_sites})", min_value=1, max_value=total_sites if total_sites > 0 else 1, value=min(20, total_sites), step=10)
     
