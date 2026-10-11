@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 st.set_page_config(page_title="Men-AI-ter", page_icon="🌞", layout="wide")
 
 MAX_WORKERS = 10
-VCOM_MICRO_DELAY = 0.1
+VCOM_MICRO_DELAY = 0.1 
 
 # --- הגדרות SolarEdge ---
 API_KEY = "K0X7PD9WAJ11B33DM7BUWNY6VCJ9YVFS"
@@ -135,7 +135,7 @@ def is_real_string(site_id, inv_id, abbr, auth, headers, target_date_str):
 def load_metadata():
     try:
         df = pd.read_csv('sites_metadata.csv', encoding='utf-8-sig') 
-        df = df[df['Is_Active'] == 1]
+        df = df[df['Is_Active'].astype(str).str.strip() == '1']
         df = df[~df['Name'].str.contains(r'DELETED|DISABLED|\*|^Z\s*-', na=False, case=False)]
         df = df.dropna(subset=['Latitude', 'Longitude'])
         df['Capacity_kWp'] = pd.to_numeric(df['Capacity_kWp'], errors='coerce') 
@@ -156,6 +156,10 @@ def get_capacity_from_model(model_name):
 def get_inverter_diagnosis(row, target_date):
     site_id = str(row['Site_ID'])
     portal = row.get('Portal', 'SolarEdge')
+    site_specific_yield = row.get('Specific_Yield', 5.0)
+    
+    # ביום מעונן מאוד (תפוקה נמוכה מ-1.5), נקשיח את הרגישות כדי שענן חולף לא יקפיץ תקלת ממיר
+    low_output_threshold = 0.65 if (pd.notnull(site_specific_yield) and site_specific_yield < 1.5) else 0.75
     
     if portal == 'VCOM':
         auth, headers = get_vcom_auth(row['Account_Name'])
@@ -203,7 +207,7 @@ def get_inverter_diagnosis(row, target_date):
             if energy == 0:
                 faults.append(f"{name}: 0 {unit}")
             elif max_energy > 0 and energy < (max_energy * 0.95):
-                if energy < (max_energy * 0.75):
+                if energy < (max_energy * low_output_threshold):
                     faults.append(f"{name}: Low Output ({energy:.2f} vs max {max_energy:.2f} {unit})")
                 suspect_inverters_for_dc.append((inv_id, name))
 
@@ -250,7 +254,7 @@ def get_inverter_diagnosis(row, target_date):
                                 
                 if not raw_string_medians: continue
                 
-                # התיקון הגדול: סינון ערוצי רפאים לפני חישוב החציון של הממיר
+                # סינון ערוצי רפאים לפני חישוב החציון של הממיר
                 valid_string_medians = {}
                 for abbr, current in raw_string_medians.items():
                     if current < 0.5:
@@ -267,7 +271,7 @@ def get_inverter_diagnosis(row, target_date):
                 for abbr, current in valid_string_medians.items():
                     if current < 0.5: 
                         faults.append(f"{inv_name} ({abbr}): 0A (Suspected Open String)")
-                    elif inv_median_current > 2.0 and current < (inv_median_current * 0.75): 
+                    elif inv_median_current > 2.0 and current < (inv_median_current * low_output_threshold): 
                         faults.append(f"{inv_name} ({abbr}): Low DC ({current:.1f} vs avg {inv_median_current:.1f})")
                         
         return "Faults: " + " | ".join(set(faults)) if faults else "Inverters balanced. Check Shading/Soiling."
@@ -317,7 +321,7 @@ def get_inverter_diagnosis(row, target_date):
                 cap_label = f"[{data['capacity']:g}kW]" if data['capacity'] > 0 else ""
                 if data['energy'] == 0:
                     local_faults.append(f"{name} {cap_label}: 0 kWh")
-                elif data['specific_yield'] < (max_specific_yield * 0.75): 
+                elif data['specific_yield'] < (max_specific_yield * low_output_threshold): 
                     local_faults.append(f"{name} {cap_label}: Low Output ({data['energy']:.1f} kWh)")
                     
             return "Faults: " + " | ".join(local_faults) if local_faults else "Inverters balanced. Check Shading/Soiling."
@@ -352,14 +356,12 @@ with st.sidebar:
             
             st.markdown("**Select portfolios to scan:**")
             
-            # יצירת תיבות סימון עצמאיות למראה של רשימה פתוחה
             chk_test = st.checkbox("🧪 Test Mode (Custom Sample)", value=False)
             chk_se = st.checkbox("☀️ All SolarEdge Sites", value=False)
             chk_vcom_elec = st.checkbox("⚡ VCOM: electraservice", value=True)
             chk_vcom_pv = st.checkbox("⚡ VCOM: ELECTRA - PV", value=False)
             chk_all = st.checkbox(f"⚠️ Scan ALL ({total_sites} sites - High Timeout Risk)", value=False)
             
-            # איסוף כל התיבות שסומנו לרשימה אחת
             if chk_test: scan_modes.append("🧪 Test Mode (Custom Sample)")
             if chk_se: scan_modes.append("☀️ All SolarEdge Sites")
             if chk_vcom_elec: scan_modes.append("⚡ VCOM: electraservice")
@@ -494,8 +496,8 @@ if run_button:
             
     df_baselines = pd.DataFrame(baseline_data)
     
-    # --- שלב 2: עיבוד נתונים (Geo-Clustering) ---
-    status_text.text("2/3: Running Geo-Clustering...")
+    # --- שלב 2: עיבוד נתונים ונירמול עננות (Geo-Clustering & Weather Shield) ---
+    status_text.text("2/3: Running Geo-Clustering & Weather Normalization...")
     df_master = pd.merge(df_baselines, df_sites, on='Site_ID', how='inner')
     
     df_master['Specific_Yield'] = df_master['Energy_kWh'] / df_master['Capacity_kWp']
@@ -508,16 +510,36 @@ if run_button:
     df_master['Lat_Grid'] = df_master['Latitude'].astype(float).round(1)
     df_master['Lon_Grid'] = df_master['Longitude'].astype(float).round(1)
     
-    cluster_medians = df_master.groupby(['Lat_Grid', 'Lon_Grid'])['Specific_Yield'].median().reset_index()
-    cluster_medians.rename(columns={'Specific_Yield': 'Cluster_Median_Yield'}, inplace=True)
-    df_master = pd.merge(df_master, cluster_medians, on=['Lat_Grid', 'Lon_Grid'], how='left')
+    # חישוב מדדים אזוריים (כולל כמה האזור כולו ירד היום בגלל עננים)
+    cluster_stats = df_master.groupby(['Lat_Grid', 'Lon_Grid']).agg(
+        Raw_Cluster_Yield=('Specific_Yield', 'median'),
+        Cluster_7D_Median=('7D_Change_%', 'median'),
+        Cluster_YoY_Median=('YoY_Change_%', 'median'),
+        Cluster_Size=('Site_ID', 'count')
+    ).reset_index()
+    
+    df_master = pd.merge(df_master, cluster_stats, on=['Lat_Grid', 'Lon_Grid'], how='left')
+    
+    # גיבוי לאתרים מבודדים (פחות מ-3 אתרים באשכול): שימוש בחציון הכללי במקום להשוות את האתר לעצמו
+    global_yield_med = df_master['Specific_Yield'].median()
+    global_7d_med = df_master['7D_Change_%'].median()
+    global_yoy_med = df_master['YoY_Change_%'].median()
+    
+    df_master['Cluster_Median_Yield'] = np.where(df_master['Cluster_Size'] >= 3, df_master['Raw_Cluster_Yield'], global_yield_med)
+    df_master['Area_7D_Trend'] = np.where(df_master['Cluster_Size'] >= 3, df_master['Cluster_7D_Median'], global_7d_med)
+    df_master['Area_YoY_Trend'] = np.where(df_master['Cluster_Size'] >= 3, df_master['Cluster_YoY_Median'], global_yoy_med)
     
     df_master['Performance_vs_Cluster'] = np.where(df_master['Cluster_Median_Yield'] > 0, df_master['Specific_Yield'] / df_master['Cluster_Median_Yield'], np.nan)
     
+    # חישוב מגמה "נטו" (מנוטרלת מזג אוויר): כמה האתר ירד מעבר לירידה של השכנים שלו
+    df_master['Net_7D_Change_%'] = df_master['7D_Change_%'] - df_master['Area_7D_Trend'].fillna(0)
+    df_master['Net_YoY_Change_%'] = df_master['YoY_Change_%'] - df_master['Area_YoY_Trend'].fillna(0)
+    
     df_master['Needs_Deep_Scan'] = (
-        (df_master['Performance_vs_Cluster'] < 0.97) | 
-        (df_master['7D_Change_%'] < -3.0) | 
-        (df_master['YoY_Change_%'] < -10.0)
+        (df_master['Performance_vs_Cluster'] < 0.95) | 
+        (df_master['Net_7D_Change_%'] < -5.0) | 
+        (df_master['Net_YoY_Change_%'] < -12.0) |
+        (df_master['Specific_Yield'] == 0)
     )
     
     if selected_sites:
@@ -549,10 +571,11 @@ if run_button:
         
     df_master['System_Diagnosis'] = df_master['Site_ID'].map(diagnoses_dict).fillna("Skipped (Site Optimal - No Drops Detected)")
     
+    # התראה תופעל רק אם יש תקלת ממירים/סטרינגים מוכחת, או צניחה חריפה *ביחס לאזור*
     df_master['Alert_Status'] = np.where(
         (df_master['Performance_vs_Cluster'] < 0.80) | 
-        (df_master['7D_Change_%'] < -10.0) | 
-        (df_master['YoY_Change_%'] < -20.0) |
+        (df_master['Net_7D_Change_%'] < -15.0) | 
+        (df_master['Net_YoY_Change_%'] < -25.0) |
         (df_master['System_Diagnosis'].str.contains('0 kWh|0A|Low Current|Low Output|Offline|Low DC|Faults', na=False, regex=True)), 
         '🔴 Fault Suspected', 
         '🟢 OK'
